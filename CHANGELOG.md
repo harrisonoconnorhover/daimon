@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Discord `/routines` now offers a New routine form and a Delete confirmation. Creation requires Manage Server; deletion rechecks the routine creator or server admin before removing it.
+
 - **Fleet roots now run against one retained original reservation.** A fleet root is admitted once against a scoped hold that it keeps for its whole run: pending financial state is settled before any funding check, each original input the root sends is counted against that hold, and a native root carries its explicit budget into the session. A root is an ordinary agent session, so it keeps the agent's personal memory store, which is neither counted nor funded. Off by default: fleet roots run only with `DAIMON_FLEET__ENABLED=true`. No migration.
 - Approval cards for classified third-party MCP writes now offer **Always allow** when agent tool rules are enabled. Workspace admins save a chat-only rule for the agent; channel admins save one for the parent channel. The click approves the pending call, and a concurrent rule edit leaves it approved for this time only. Discord, Slack and Teams show who answered and whether the rule was saved.
 
