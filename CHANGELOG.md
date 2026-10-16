@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Show every counted category in Discord, Slack and Teams account-deletion previews,
+  including feedback, credential requests, wizard sessions and support escalations.
+  Slack and Teams export summaries include those records too. Agent-post attribution
+  is described as removed while the posts are kept; long examples no longer crowd
+  the category list beyond card limits.
+
 - Require fleet reviewers to use a different backend from the primary, including retained reviews checked before summary delivery.
 
 - Allow fresh Gemini preparation for a new mention thread while preserving an existing session when replacement is unsupported.
