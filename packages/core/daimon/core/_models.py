@@ -130,9 +130,7 @@ class Account(Base):
         index=True,
     )
     role: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
-    # The platform roles the member held on their last chat turn, refreshed
-    # with `role`, so MCP calls can match a channel admin role grant without a
-    # live platform lookup. Empty on platforms without roles.
+    # Legacy role ids retained with the existing account column.
     platform_role_ids: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
     )
@@ -391,7 +389,6 @@ class ChannelConfig(Base):
         nullable=True,
     )
     # A server admin set `agent_name`, as decided when it was set: that makes the
-    # agent this channel's admins' to administer (`daimon.core.authz.channel_admin_holds`).
     agent_name_set_by_admin: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
@@ -689,53 +686,6 @@ class TurnCardIntent(Base):
     )
 
 
-class GitHubOauthState(Base):
-    __tablename__ = "github_oauth_states"
-
-    state: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        server_default=func.gen_random_uuid(),
-    )
-    platform: Mapped[str] = mapped_column(Text, nullable=False)
-    platform_user_id: Mapped[str] = mapped_column(Text, nullable=False)
-    scopes: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)  # snapshot of scopes
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
-    )
-    agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-
-
-class GitHubCredential(Base):
-    __tablename__ = "github_credentials"
-
-    # principal_id is an untyped UUID PK — no FK constraint. Rationale:
-    # principals are split across cli_principals and platform_principals tables
-    # (polymorphic). The resolver signature `get_pat(principal_id, agent_id)`
-    # accepts whichever principal type the caller has. A FK to a single principal
-    # table would over-constrain. Mirrors the project's existing polymorphic
-    # principal handling (PrincipalLink uses two FK columns; we don't have a
-    # unified principals table). If/when one is added, this is a mechanical
-    # migration.
-    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    github_login: Mapped[str] = mapped_column(Text, nullable=False)
-    encrypted_token: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    scopes: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-
 class UserSkill(Base):
     """User-managed skill row.
 
@@ -829,18 +779,6 @@ class SeededSkill(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
-
-
-class AgentGithubBinding(Base):
-    """Per-agent GitHub credential overlay. Day-1 always empty; populated by
-    the working-repo binding path (`request_repo_binding`). Single credential
-    per principal day-1, so no github_login discriminator.
-    """
-
-    __tablename__ = "agent_github_binding"
-
-    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
 
 
 class AgentGoogleBinding(Base):
@@ -1137,10 +1075,9 @@ class ChannelSkill(Base):
 
 
 class AgentCreationChannel(Base):
-    """The channel an agent was created for, by a channel admin of it, from there.
+    """The legacy channel recorded when an agent was created.
 
-    Its admins administer the agent while it stays local to their channels
-    (`daimon.core.authz.channel_admin_holds`). No row: nobody's but server admins'.
+    Rows remain for a later data cleanup.
     """
 
     __tablename__ = "agent_creation_channels"
@@ -1457,91 +1394,6 @@ class PrivacySessionDelete(Base):
     )
 
 
-class AgentRepoBinding(Base):
-    """Per-(tenant, agent) git repo overlay binding."""
-
-    __tablename__ = "agent_repo_binding"
-    __table_args__ = (PrimaryKeyConstraint("tenant_id", "agent_id", name="pk_agent_repo_binding"),)
-
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("tenants.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    repo_url: Mapped[str] = mapped_column(Text, nullable=False)
-    default_branch: Mapped[str] = mapped_column(Text, nullable=False)
-    ma_secret_ref: Mapped[str] = mapped_column(Text, nullable=False)
-    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    proof_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
-    proof_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    proof_account_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("accounts.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-
-class AgentSkillRepoCredential(Base):
-    """Per-(tenant, agent, repo) token for importing skills from a git repo.
-
-    Deliberately NOT a column on `AgentRepoBinding`. That table is keyed
-    (tenant_id, agent_id) because an agent has exactly one working repo — the
-    one it clones — whereas it may import skills from any number of repos. If
-    the skill token lived on the binding, enrolling a skill repo would
-    re-point the working repo (and enrolling a second skill repo would evict
-    the first). The two must never move each other, so they are two tables and
-    this one carries `repo_url` in its primary key.
-
-    `repo_url` is the canonical `owner/repo` form; the store normalizes it on
-    every write and every read key. `path` is the in-repo subdirectory skills
-    are read from, empty string for the repo root. The three proof columns
-    mirror `AgentRepoBinding`'s: what was established about read access at
-    enrollment time, and by whom.
-    """
-
-    __tablename__ = "agent_skill_repo_credentials"
-    __table_args__ = (
-        PrimaryKeyConstraint(
-            "tenant_id", "agent_id", "repo_url", name="pk_agent_skill_repo_credentials"
-        ),
-        Index("ix_agent_skill_repo_credentials_tenant_repo", "tenant_id", "repo_url"),
-    )
-
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("tenants.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    repo_url: Mapped[str] = mapped_column(Text, nullable=False)
-    default_branch: Mapped[str] = mapped_column(Text, nullable=False)
-    path: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    ma_secret_ref: Mapped[str] = mapped_column(Text, nullable=False)
-    proof_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
-    proof_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    proof_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-
 class AgentMemoryStore(Base):
     """Per-(tenant, agent) MA memory store binding (agent memory feature)."""
 
@@ -1608,6 +1460,9 @@ class GitHubAppInstallation(Base):
     installation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     account_login: Mapped[str] = mapped_column(Text, nullable=False)
     repo_full_names: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    github_repo_full_names: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    github_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    github_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     app: Mapped[str] = mapped_column(Text, nullable=False, server_default="legacy")
     account_id: Mapped[int | None] = mapped_column(BigInteger)
     account_type: Mapped[str | None] = mapped_column(Text)
@@ -1839,33 +1694,6 @@ class TeamsInstallation(Base):
     installed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-
-class TeamsChannelSite(Base):
-    """A Teams channel's Files folder, on a SharePoint site granted to daimon.
-
-    Written when an admin turns files on from the channel: their sign-in finds
-    the folder, which `Sites.Selected` cannot. A private or shared channel's
-    folder is on a site of its own, so this row is the only way to it.
-    """
-
-    __tablename__ = "teams_channel_sites"
-    __table_args__ = (
-        PrimaryKeyConstraint("tenant_id", "channel_id", name="pk_teams_channel_sites"),
-        ForeignKeyConstraint(
-            ["tenant_id"], ["tenants.id"], ondelete="CASCADE", name="fk_teams_channel_sites_tenants"
-        ),
-    )
-
-    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    channel_id: Mapped[str] = mapped_column(Text)
-    group_id: Mapped[str] = mapped_column(Text, nullable=False)
-    site_id: Mapped[str] = mapped_column(Text, nullable=False)
-    drive_id: Mapped[str] = mapped_column(Text, nullable=False)
-    folder_id: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -2866,12 +2694,6 @@ class TenantGitHubRepo(Base):
 
 class GitHubConnectInvitation(Base):
     __tablename__ = "github_connect_invitations"
-    __table_args__ = (
-        CheckConstraint(
-            "activation_status IS NULL OR activation_status IN ('activated', 'update_pending')",
-            name="ck_github_connect_invitation_activation",
-        ),
-    )
     token_hash: Mapped[str] = mapped_column(Text, primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE")
@@ -2884,13 +2706,11 @@ class GitHubConnectInvitation(Base):
     requester_platform_user_id: Mapped[str | None] = mapped_column(Text)
     agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     agent_name: Mapped[str | None] = mapped_column(Text)
-    # The target's Managed Agents id, so a channel admin's right to connect
     # for it can be checked again when the repos are confirmed.
     agent_ma_id: Mapped[str | None] = mapped_column(Text)
     operator_issued: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
-    activation_status: Mapped[str | None] = mapped_column(Text)
     connected_repo_count: Mapped[int | None] = mapped_column(Integer)
     origin_platform: Mapped[str | None] = mapped_column(Text)
     origin_parent_channel_id: Mapped[str | None] = mapped_column(Text)
@@ -2994,9 +2814,11 @@ class AgentGitHubGrant(Base):
     repo_id: Mapped[int] = mapped_column(BigInteger)
     baseline_access: Mapped[str] = mapped_column(Text)
     ceiling_access: Mapped[str] = mapped_column(Text)
-    staged: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     mount_path: Mapped[str | None] = mapped_column(Text)
     is_working_repo: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    # The expand phase keeps the old `staged` column for old workers. A database
+    # trigger mirrors its inverse here; new code reads only this field.
+    app_visible: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     granted_by_account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL")
     )
@@ -3157,19 +2979,6 @@ class GitHubAccessRequestDelivery(Base):
     dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-class AgentGitHubMode(Base):
-    __tablename__ = "agent_github_mode"
-    __table_args__ = (
-        PrimaryKeyConstraint("tenant_id", "agent_id"),
-        CheckConstraint("mode IN ('legacy', 'app')"),
-    )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE")
-    )
-    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    mode: Mapped[str] = mapped_column(Text, server_default="legacy")
-
-
 class GitHubUserLink(Base):
     __tablename__ = "github_user_links"
     __table_args__ = (CheckConstraint("status IN ('active', 'broken')"),)
@@ -3232,7 +3041,15 @@ class GitHubPersonalLinkIntent(Base):
 
 class GitHubIssuedToken(Base):
     __tablename__ = "github_issued_tokens"
-    __table_args__ = (CheckConstraint("status IN ('pending', 'stored', 'delivered', 'revoked')"),)
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'stored', 'delivered', 'revoked')"),
+        # Revoked rows are most of the table and no query reads them.
+        Index(
+            "ix_github_issued_tokens_live_session",
+            "session_id",
+            postgresql_where=text("status IN ('stored', 'delivered')"),
+        ),
+    )
     token_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
@@ -4016,3 +3833,19 @@ class FleetWorker(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class GeminiRuntimeState(Base):
+    """Driver records and conservative attempt holds on the host state database."""
+
+    __tablename__ = "gemini_runtime_state"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "account_id", "project", "kind"),
+        CheckConstraint("kind IN ('records', 'holds')", name="ck_gemini_runtime_state_kind"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = _tenant_fk()
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    project: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 from cryptography.fernet import Fernet
 from daimon.core.config import (
+    ANTHROPIC_UNCONFIGURED_PLACEHOLDER,
     AnthropicSettings,
     ArtifactsSettings,
     DatabaseSettings,
@@ -115,6 +116,23 @@ def test_load_settings_parses_nested_delimiter_when_env_provided(
     assert settings.anthropic.api_key.get_secret_value() == "sk-test"
     assert settings.cli.local_user == "alice"
     assert settings.log.level == "DEBUG"
+
+
+def test_settings_load_with_no_anthropic_key_for_an_openai_only_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAIMON_DATABASE__URL", "postgresql+asyncpg://u:p@h:5432/d")
+    monkeypatch.delenv("DAIMON_ANTHROPIC__API_KEY", raising=False)
+
+    settings = load_settings(_env_file=None)
+
+    assert settings.anthropic.api_key is None
+    assert settings.anthropic.resolved_api_key() == ANTHROPIC_UNCONFIGURED_PLACEHOLDER
+
+
+def test_resolved_api_key_prefers_a_configured_real_key() -> None:
+    configured = AnthropicSettings(api_key=SecretStr("sk-real"))
+    assert configured.resolved_api_key() == "sk-real"
 
 
 def test_database_pool_settings_parse_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -485,43 +503,43 @@ def test_github_settings_max_tarball_bytes_env_override_to_zero_disables(
     )
 
 
-# --- GithubSettings app_private_key base64-tolerant loading ---
+# --- GithubSettings private_key base64-tolerant loading ---
 
 _FAKE_PEM = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\nlmnop\n-----END RSA PRIVATE KEY-----\n"
 
 
-def test_github_app_private_key_raw_pem_passes_through() -> None:
+def test_github_private_key_raw_pem_passes_through() -> None:
     """A raw multi-line PEM is stored unchanged (Fly / Cloud Run delivery)."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
-    settings = GithubSettings(app_private_key=_FAKE_PEM)
-    assert settings.app_private_key is not None, "key should be set"
-    assert settings.app_private_key.get_secret_value() == _FAKE_PEM, (
+    settings = GithubAppSettings(private_key=_FAKE_PEM)
+    assert settings.private_key is not None, "key should be set"
+    assert settings.private_key.get_secret_value() == _FAKE_PEM, (
         "raw PEM must be stored byte-for-byte, unchanged"
     )
 
 
-def test_github_app_private_key_base64_decodes_to_pem() -> None:
+def test_github_private_key_base64_decodes_to_pem() -> None:
     """A base64-encoded PEM (single-line, env_file-safe) decodes back to the PEM."""
     import base64
 
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     encoded = base64.b64encode(_FAKE_PEM.encode()).decode()
     assert "-----BEGIN" not in encoded, "base64 must not contain PEM delimiters"
-    settings = GithubSettings(app_private_key=encoded)
-    assert settings.app_private_key is not None, "key should be set"
-    assert settings.app_private_key.get_secret_value() == _FAKE_PEM, (
+    settings = GithubAppSettings(private_key=encoded)
+    assert settings.private_key is not None, "key should be set"
+    assert settings.private_key.get_secret_value() == _FAKE_PEM, (
         "a base64-encoded PEM must decode to the original PEM"
     )
 
 
-def test_github_app_private_key_none_stays_none() -> None:
+def test_github_private_key_none_stays_none() -> None:
     """Unset key remains None (deployments without a GitHub App)."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
-    settings = GithubSettings()
-    assert settings.app_private_key is None, "unset private key must remain None"
+    settings = GithubAppSettings()
+    assert settings.private_key is None, "unset private key must remain None"
 
 
 # --- GithubSettings app_slug validation ---
@@ -529,66 +547,66 @@ def test_github_app_private_key_none_stays_none() -> None:
 
 def test_github_app_slug_defaults_to_none() -> None:
     """Unset app_slug remains None (deployment with no GitHub App install link)."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
-    settings = GithubSettings()
+    settings = GithubAppSettings()
     assert settings.app_slug is None, "unset app_slug must remain None"
 
 
 def test_github_app_slug_accepts_valid_slug() -> None:
     """A slug of letters, digits and hyphens is accepted unchanged."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
-    settings = GithubSettings(app_slug="acme-daimon-42")
+    settings = GithubAppSettings(app_slug="acme-daimon-42")
     assert settings.app_slug == "acme-daimon-42", "valid slug must be stored unchanged"
 
 
 def test_github_app_slug_rejects_empty_string() -> None:
     """An empty app_slug is rejected rather than silently accepted."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     with pytest.raises(ValidationError):
-        GithubSettings(app_slug="")
+        GithubAppSettings(app_slug="")
 
 
 def test_github_app_slug_rejects_slash() -> None:
     """A slug containing '/' is rejected (a URL fragment, not a slug)."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     with pytest.raises(ValidationError):
-        GithubSettings(app_slug="acme/daimon")
+        GithubAppSettings(app_slug="acme/daimon")
 
 
 def test_github_app_slug_rejects_dot() -> None:
     """A slug containing '.' is rejected."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     with pytest.raises(ValidationError):
-        GithubSettings(app_slug="acme.daimon")
+        GithubAppSettings(app_slug="acme.daimon")
 
 
 def test_github_app_slug_rejects_at_sign() -> None:
     """A slug containing '@' is rejected."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     with pytest.raises(ValidationError):
-        GithubSettings(app_slug="acme@daimon")
+        GithubAppSettings(app_slug="acme@daimon")
 
 
 def test_github_app_slug_rejects_leading_hyphen() -> None:
     """A slug with a leading hyphen is rejected."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     with pytest.raises(ValidationError):
-        GithubSettings(app_slug="-acme-daimon")
+        GithubAppSettings(app_slug="-acme-daimon")
 
 
 def test_github_app_slug_rejects_over_length_cap() -> None:
     """A slug over the length cap is rejected."""
-    from daimon.core.config import GithubSettings
+    from daimon.core.config import GithubAppSettings
 
     with pytest.raises(ValidationError):
-        GithubSettings(app_slug="a" * 101)
+        GithubAppSettings(app_slug="a" * 101)
 
 
 # --- SlackSettings tests ---
@@ -816,12 +834,22 @@ def test_teams_tenant_id_rejects_non_uuid() -> None:
         )
 
 
-def test_teams_admin_user_ids_canonicalize_and_reject_non_uuids() -> None:
-    base = {"client_id": "id", "client_secret": SecretStr("s"), "tenant_id": str(UUID(int=1))}
-    admin = str(UUID(int=7))
-    assert TeamsSettings(**base, admin_user_ids=(admin.upper(),)).admin_user_ids == (admin,)
-    with pytest.raises(ValidationError):
-        TeamsSettings(**base, admin_user_ids=("alice",))
+@pytest.mark.parametrize(
+    "leftover", ['["00000000-0000-0000-0000-000000000007"]', "alice, not json"]
+)
+def test_a_leftover_teams_admin_user_ids_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, leftover: str
+) -> None:
+    """The removed admin list may still be set; startup must not fail on it."""
+    monkeypatch.setenv("DAIMON_DATABASE__URL", "postgresql+asyncpg://u:p@h:5432/d")
+    monkeypatch.setenv("DAIMON_ANTHROPIC__API_KEY", "sk-test")
+    monkeypatch.setenv("DAIMON_TEAMS__CLIENT_ID", "id")
+    monkeypatch.setenv("DAIMON_TEAMS__CLIENT_SECRET", "s")
+    monkeypatch.setenv("DAIMON_TEAMS__TENANT_ID", str(UUID(int=1)))
+    monkeypatch.setenv("DAIMON_TEAMS__ADMIN_USER_IDS", leftover)
+    teams = load_settings(_env_file=None).teams
+    assert teams is not None and teams.tenant_id == str(UUID(int=1)), "Teams still loads"
+    assert "admin_user_ids" not in teams.model_dump(), "the old list is no longer read"
 
 
 def test_completion_policy_validates_and_normalizes_uuid_keys(monkeypatch):
@@ -1018,3 +1046,26 @@ def test_discord_credential_expiry_requires_explicit_opt_in(monkeypatch, configu
     )
     actual = load_settings(_env_file=None).discord
     assert actual is not None and actual.credential_form_expiry is (configured == "true")
+
+
+@pytest.mark.parametrize(
+    "cutoff", ["1970-01-01T00:00:00Z", "2026-10-15T23:59:59Z", "garbage", "2026-10-16T00:00:00"]
+)
+def test_mcp_legacy_cutoff_rejects_unsafe_or_naive_dates(cutoff: str) -> None:
+    with pytest.raises(ValidationError):
+        McpSettings.model_validate({"legacy_token_cutoff": cutoff})
+
+
+def test_mcp_legacy_window_is_explicit_bounded_and_expired_windows_boot_strict() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    assert not McpSettings().allow_legacy_tokens
+    with pytest.raises(ValidationError):
+        McpSettings(allow_legacy_tokens=True)
+    with pytest.raises(ValidationError):
+        McpSettings(
+            allow_legacy_tokens=True, legacy_token_cutoff=datetime.now(UTC) + timedelta(hours=7)
+        )
+    assert McpSettings(
+        allow_legacy_tokens=True, legacy_token_cutoff=datetime.now(UTC) - timedelta(minutes=1)
+    )

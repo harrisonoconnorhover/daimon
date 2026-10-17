@@ -42,6 +42,7 @@ from mux.contracts.resources import (
 )
 from mux.drivers.gemini.bundles import inline_files, skill_sources, target_path, validate_targets
 from mux.drivers.gemini.mcp_auth import (
+    GCSSecretResolver,
     MCPSecretResolver,
     authenticated_template,
     compile_mcp,
@@ -106,15 +107,23 @@ class Base:
         account_scope_id: str,
         *,
         mcp_secrets: MCPSecretResolver | None = None,
+        gcs_secrets: GCSSecretResolver | None = None,
         native_agent: Agent | None = None,
         max_total_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        max_input_tokens: int | None = None,
     ) -> None:
+        self._max_input_tokens = max_input_tokens
+        if max_input_tokens is not None and (
+            type(max_input_tokens) is not int or max_input_tokens <= 0 or max_output_tokens is None
+        ):
+            refuse("worker_token_envelope")
         self._max_output_tokens = max_output_tokens
         self._max_total_tokens = max_total_tokens
         self._native_agent = native_agent
         self._transport, self._storage, self._account = transport, storage, account_scope_id
         self._mcp_secrets = mcp_secrets
+        self._gcs_secrets = gcs_secrets
 
     def _mcp_request(self, records: Records, scope: Scope, spec: SessionSpec) -> Object:
         """Rebuild owned intent before authentication; never trust a saved tool list."""
@@ -137,7 +146,11 @@ class Base:
             max_output_tokens=self._max_output_tokens,
         )
         if self._max_output_tokens is not None:
-            if self._native_agent is not None or spec.environment is not None or spec.resources:
+            if (
+                (self._native_agent is not None and self._max_input_tokens is None)
+                or spec.environment is not None
+                or spec.resources
+            ):
                 refuse("model_interaction_resources")
             return request
         if self._native_agent is not None:
@@ -621,7 +634,12 @@ class GeminiSessions(Base):
                 state="idle",
             )
             records.sessions[id_] = SessionRecord(
-                owner(scope), session, spec, agent.spec.model, request
+                owner(scope),
+                session,
+                spec,
+                agent.spec.model,
+                request,
+                max_input_tokens=self._max_input_tokens,
             )
             records.creations[(*owner(scope), key)] = scope.principal_id, digest, id_
             return session
@@ -715,18 +733,22 @@ class GeminiEvents(Base):
         state_store: StateStore,
         model_for_interaction: Callable[[str], ModelRef | None] | None = None,
         mcp_secrets: MCPSecretResolver | None = None,
+        gcs_secrets: GCSSecretResolver | None = None,
         native_agent: Agent | None = None,
         max_total_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        max_input_tokens: int | None = None,
     ) -> None:
         super().__init__(
             transport,
             storage,
             account_scope_id,
             mcp_secrets=mcp_secrets,
+            gcs_secrets=gcs_secrets,
             native_agent=native_agent,
             max_total_tokens=max_total_tokens,
             max_output_tokens=max_output_tokens,
+            max_input_tokens=max_input_tokens,
         )
         self._state_store = state_store
         self._model_for_interaction = model_for_interaction
@@ -825,6 +847,7 @@ class GeminiEvents(Base):
                             connections,
                             self._mcp_secrets,
                             overrides={},
+                            gcs_secrets=self._gcs_secrets,
                         )
                         raw = await self._get(record, receipt.input_ids[0])
                         self._accept(record, raw, receipt.turn_id, events)
@@ -838,7 +861,9 @@ class GeminiEvents(Base):
                 not isinstance(event, UserMessage) for event in events
             ):
                 refuse("model_interaction_resources")
-            if self._max_total_tokens is not None and (
+            if record.max_input_tokens != self._max_input_tokens:
+                refuse("changed_worker_token_envelope")
+            if (self._max_total_tokens is not None or self._max_input_tokens is not None) and (
                 record.current is not None
                 or len(events) != 1
                 or not isinstance(events[0], UserMessage)
@@ -898,10 +923,19 @@ class GeminiEvents(Base):
                 connections,
                 self._mcp_secrets,
                 overrides=overrides,
+                gcs_secrets=self._gcs_secrets,
             )
             if record.current is not None and authenticated:
                 # Admission/authentication precedes this native history read.
                 await self._get(record, record.current)
+            if self._max_input_tokens is not None:
+                from mux.drivers.gemini.transport import TokenCountingTransport
+
+                if not isinstance(self._transport, TokenCountingTransport):
+                    refuse("worker_input_token_count")
+                count = await self._transport.count_input_tokens(request)
+                if type(count) is not int or count <= 0 or count > self._max_input_tokens:
+                    refuse("worker_input_token_limit")
             root = record.root if is_result else str(uuid4())
             if root is None:
                 refuse("unknown_function_action")
@@ -935,7 +969,7 @@ class GeminiEvents(Base):
                 return unknown
             # Definite refusal permits a new operation, but never retries this key.
             await self._state_store.advance_operation(scope, key, "failed", now=now(), fence=None)
-            async with self._storage.transaction() as records:
+            async with self._storage.transaction(after_dispatch=True) as records:
                 record = self._record(records, scope, session)
                 record.unknown_delivery = False
             if exc.category == "not_found" and request.get("previous_interaction_id") is not None:
@@ -951,7 +985,7 @@ class GeminiEvents(Base):
             raise ProviderError(
                 "upstream", retryable=False, native_code="malformed_interaction"
             ) from None
-        async with self._storage.transaction() as records:
+        async with self._storage.transaction(after_dispatch=True) as records:
             record = self._record(records, scope, session)
             interaction = string(raw["id"])
             if not is_result:

@@ -4,13 +4,79 @@ This guide expands the README quickstart. It covers the full Docker Compose
 setup, running the processes by hand, Slack, Microsoft Teams, the Claude Code
 login mounts, chart storage and connecting MCP servers.
 
+## Upgrading an existing installation
+
+The new MCP server is strict immediately by default: credentials need a live
+registry entry. Re-mint old CLI or MCP-client tokens that do not contain a `jti`
+with the updated `daimon mcp mint-token` command, then replace them in the
+clients that use them. Use the updated agent/operator mint commands for those
+credential types. Treat command output as a credential and store it privately.
+
+Chat credentials renew automatically on session reuse and agent-chat or hub
+continuation. Existing turns using older vault credentials can stop reaching
+MCP if the verifier is upgraded before their minters. Use a staged upgrade when
+preserving those turns matters.
+
+### Staged MCP upgrade
+
+1. Apply migrations with the existing migration procedure. Deploy the updated
+   MCP service first: it also creates credentials for agent-chat, hub and OAuth
+   sessions. For the initial rollout only, explicitly set
+   `DAIMON_MCP__ALLOW_LEGACY_TOKENS=true` and
+   `DAIMON_MCP__LEGACY_TOKEN_CUTOFF` to a timezone-aware UTC deadline five hours
+   ahead. Only non-internal legacy credentials qualify. Unregistered internal
+   credentials are refused immediately, including during this window; replace
+   any external callers with registered credentials before updating MCP.
+2. Update every credential minter, including platform workers, the scheduler
+   and any separately installed CLI. Refresh notebook services too. Record when
+   worker refresh completes and when the new MCP revision finishes deploying.
+   Old MCP requests can still create credentials after traffic switches, so
+   add the old revision's request timeout to its deployment completion time.
+3. From the later of worker completion and that last possible old MCP mint,
+   allow the existing 45-minute turn ceiling plus one minute. Complete this
+   drain before the original deadline.
+4. Set `DAIMON_MCP__ALLOW_LEGACY_TOKENS=false` on every MCP replica. After this
+   flip, or when the deadline passes, every unregistered credential is refused
+   regardless of issuance time. Keep clients on the updated minters.
+
+The deployment workflow automates this order for an existing MCP service. A
+retry preserves the original deadline; it never extends or reopens the window.
+An expired deadline allows boot but remains strict. Configuration refuses dates
+before 2026-10-16 UTC, naive/invalid dates and deadlines over six hours ahead.
+Enabling compatibility without an explicit deadline is also refused.
+
+A missing MCP service needs deliberate provisioning before this workflow. A
+stopped worker cannot provide a refresh receipt; resume and update it before
+attempting the first cutover. Do not fabricate a receipt. Rolling back to old
+minters after strict admission is unsupported: their output will be refused.
+
+### Interrupted rollout and recovery
+
+If rollout stops after the MCP update but before worker refresh, the deadline
+still closes admission automatically. Old workers can then lose MCP access
+until they are updated. Alert on the failed rollout and authentication failures;
+finish worker refresh promptly, using the original deadline. If it has already
+expired, repair the minters while leaving admission strict. Do not reset the
+window to hide an interrupted upgrade.
+
+A provider or database error during credential renewal prevents a continued
+turn from sending. Check those dependencies and retry; renewal keeps the
+existing session mutation fence. Renewal never creates a missing credential
+slot or replaces a person's OAuth credential.
+
+Billing checkout revokes its temporary credential after the HTTP hop. Cleanup
+failure is logged without credential values and preserves the checkout URL or
+original HTTP error; the original ten-minute expiry remains its upper bound.
+
 ## Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) 23 or later (the image build
   needs BuildKit) with Compose.
 - An Anthropic API key **in a workspace dedicated to this deployment**.
   Daimon manages the workspace's Managed Agents resources as its own, so
-  sharing the workspace with anything else causes collisions.
+  sharing the workspace with anything else causes collisions. Skip this if
+  you're self-hosting on OpenAI only — see
+  [Self-host on OpenAI](#self-host-on-openai).
 
 ## 1. Configure the environment
 
@@ -20,7 +86,8 @@ cp .env.example .env
 
 Open `.env`, then uncomment and fill in:
 
-- `DAIMON_ANTHROPIC__API_KEY`: your Anthropic API key.
+- `DAIMON_ANTHROPIC__API_KEY`: your Anthropic API key. Leave unset if you're
+  self-hosting on OpenAI only — see [Self-host on OpenAI](#self-host-on-openai).
 - `DAIMON_MCP__JWT_SECRET`: any random string, e.g. `openssl rand -hex 32`.
 - `DAIMON_MCP__PUBLIC_URL`: `http://localhost:8765/mcp` is fine for local use.
 - `POSTGRES_PASSWORD`: a strong, URL-safe value (avoid `@ : / % #`).
@@ -33,9 +100,11 @@ Open `.env`, then uncomment and fill in:
   [Agent environment encryption](#agent-environment-encryption)). Back it up
   separately from the database.
 
-The first four must be set before the first `docker compose` command:
-`docker-compose.yml` interpolates them for every service with fail-fast
-`${VAR:?...}` guards. Set `DAIMON_CRYPTO__KEYS` at the same time; after the
+`DAIMON_MCP__JWT_SECRET`, `DAIMON_MCP__PUBLIC_URL` and `POSTGRES_PASSWORD`
+must be set before the first `docker compose` command: `docker-compose.yml`
+interpolates them for every service with fail-fast `${VAR:?...}` guards.
+`DAIMON_ANTHROPIC__API_KEY` has no such guard — an OpenAI-only deployment
+needs it left unset. Set `DAIMON_CRYPTO__KEYS` at the same time; after the
 stack is up, `docker compose run --rm init "daimon crypto verify"` confirms it
 is set and that no agent key is stored in plaintext. `.env` is gitignored, so secrets never get committed.
 `.env.example` documents every other setting.
@@ -89,7 +158,11 @@ docker compose up --build -d
 
 This brings up Postgres, runs migrations and seeds the default agents,
 environments and skills (the `init` service does both), then starts the
-`mcp`, `discord` and `scheduler` services.
+`mcp`, `discord` and `scheduler` services. `docker compose up -d` doesn't
+show `init`'s output; if you meant to run on Anthropic and forgot
+`DAIMON_ANTHROPIC__API_KEY`, the stack still starts (an OpenAI-only
+deployment needs it unset), so check `docker compose logs init` once —
+it prints plainly whether it seeded Anthropic defaults or skipped them.
 
 Set `DAIMON_DATABASE__POOL_SIZE`, `DAIMON_DATABASE__MAX_OVERFLOW` and
 `DAIMON_DATABASE__POOL_TIMEOUT` per process when sizing Postgres for more
@@ -164,6 +237,120 @@ balancer, and a redeploy does not strand connected clients. The hourly limits
 on notebook publishes and bundle uploads are kept in memory, so each replica
 counts its own.
 
+## Self-host on OpenAI
+
+Daimon can run on just your own OpenAI key — no Anthropic account needed at
+all. The OpenAI driver (`daimon-mux[openai]`) ships in the default install
+already, so there is no separate install step. Leave
+`DAIMON_ANTHROPIC__API_KEY` unset in `.env`: `init` detects there's no
+Anthropic key and skips the Anthropic default-agent/skill reconciliation
+step instead of failing, and every service starts without one. This section
+covers the OpenAI-only setup: provisioning resources and routing channels to
+them.
+
+### What's different on OpenAI
+
+- **No multi-agent delegation.** OpenAI's hosted-workspace profile doesn't
+  support it at all — not a config gap, a capability the driver doesn't have.
+- **No mid-session resource changes.** A session's initial file mounts (the
+  main case: a GitHub-connected working copy) work; swapping them after the
+  session starts doesn't.
+- **No workspace export/import** — there's no way to export a live OpenAI
+  session's workspace or restore one from a saved export.
+- **No memory across turns.** Every OpenAI-routed turn starts fresh.
+- **No Daimon model knobs.** The OpenAI driver fixes its own model and
+  container defaults (see `docs/mux.md`'s "OpenAI deployment runtime" and
+  "Preserving source capabilities in an OpenAI hosted workspace" sections).
+
+Everything else — the chat platforms, the default skill set, scheduled
+routines — works the same regardless of provider.
+
+### 1. Get an OpenAI API key and project
+
+Create (or choose) an OpenAI project and an API key scoped to it. Add it to
+`.env` under its own name, never the reserved `OPENAI_*` namespace Daimon
+refuses to read credentials from:
+
+```bash
+DAIMON_CHANNEL_OPENAI_KEY=sk-...
+```
+
+`DAIMON_CHANNEL_OPENAI_KEY` is the default name both `daimon openai init` and
+the runtime file expect; pass `--api-key-env` to `init` if you'd rather name
+it something else. The name is all the runtime file ever records — never the
+key itself.
+
+### 2. Provision the agent, environment and default skills
+
+```bash
+docker compose run --rm init "daimon openai init --tenant-id <your-tenant-uuid> --project <openai-project-id> --model <openai-model-id>"
+```
+
+This creates (or reuses, if you run it again) one OpenAI agent, one hosted
+environment, and uploads every skill under `defaults/skills/` onto that
+agent — the same default skill set an Anthropic deployment gets from `daimon
+defaults apply` — then writes one row for them into the provider runtime
+file. It's idempotent: an identical tenant/platform/channel/account selector
+prints the existing IDs instead of provisioning (or re-seeding skills)
+twice. Pass `--skip-default-skills` for a bare agent instead. It prints only
+the created IDs — never the API key.
+
+Find your tenant UUID with `daimon tenants list` once the stack has
+auto-discovered it from a first message on another channel, or pick any
+UUID you control if this is a fresh, OpenAI-only deployment from the start.
+
+### 3. Point channels at it
+
+The one-command way: route your existing default agent's new threads to
+OpenAI entirely —
+
+```bash
+docker compose run --rm init "daimon agents backend set <agent-name-or-id> openai"
+```
+
+— after which every channel using that agent goes to OpenAI, with no
+per-channel setup. This is the same command any backend switch uses; nothing
+OpenAI-specific about it.
+
+If you'd rather route only specific channels and leave the rest on
+Anthropic, use `daimon channels rule set` per channel instead, scoped with
+`--platform`/`--channel-id`/`--account-id` on `daimon openai init` (its
+default is `*` — every platform, channel and account under your tenant, the
+single-entry default most self-hosters want, so the runtime file never needs
+one entry per channel).
+
+The wildcard is scoped to your tenant and nothing wider: `tenant_id` is
+never wildcardable, by construction — the loader refuses a manifest row that
+tries (see `docs/mux.md`'s "OpenAI deployment runtime"). One deployment's
+OpenAI resources can never serve a different tenant through this entry, even
+with every other field left as `*`; an exact, narrower row always wins over
+a coexisting wildcard default for the same tenant.
+
+Either way, add to `.env` (the `init`/`mcp`/`discord`/`slack`/`teams`/
+`scheduler` services already share `./runtime` as `/app/runtime`, see
+`docker-compose.yml`):
+
+```bash
+DAIMON_TURN__PATH=mux
+DAIMON_TURN__CHANNEL_BACKENDS=true
+DAIMON_TURN__PROVIDER_RUNTIME_FILE=/app/runtime/openai.json
+```
+
+and point step 2's `init` command at the same path with
+`--manifest /app/runtime/openai.json` (or rely on the env var above, which
+`daimon openai init` reads by default).
+
+### 4. Verify it
+
+```bash
+docker compose run --rm init "daimon openai smoke --project <openai-project-id> --model <openai-model-id>"
+```
+
+This provisions its own small dedicated agent, environment and skill
+(separate from your real one), runs one chat turn that must make one tool
+call, and exits nonzero with a clear reason unless it completed. It's
+billed — a single cheap turn, same as `daimon smoke` for Anthropic.
+
 ## Slack (optional)
 
 Slack needs a publicly reachable `DAIMON_MCP__PUBLIC_URL`. The bot token is
@@ -202,16 +389,12 @@ The scheduler removes expired connection flows, including their encrypted
 tokens. Run it alongside the MCP service.
 
 Ask an agent to connect GitHub, or run `/github connect` in Discord or Slack.
-A server admin, or a channel admin of the channels an agent is limited to,
-gets a private link bound to that agent; the selected repos are for that agent
-only and activate for it when confirmed. If the agent has a saved GitHub key,
-the key is retired once its working repo and private skill repos are among
-its repos; until then the repos wait in the agent's GitHub panel. An
+A server admin gets a private link bound to that agent; the selected repos are for that agent
+only and activate for it when confirmed. The migration retires any saved
+GitHub key. An
 operator can issue an agent-bound link with `daimon github connect-link --tenant <workspace-uuid>
 --requester <platform-user-id> --agent <agent-uuid> --agent-name <agent-name>`.
-That link stages an update. After the recipient confirms repos on the web, run
-`daimon github finish-update --tenant <workspace-uuid> --agent <agent-uuid>`
-as the operator to switch the agent and restart its open chats.
+The selected grants become live when the recipient confirms them on the web.
 Members can request setup; their request is recorded for an admin. For an
 operator fallback, print a seven-day, single-use invitation with
 `daimon github connect-link --tenant <workspace-uuid> --requester <platform-user-id>`.
@@ -231,15 +414,113 @@ GitHub link, and waiting requests. An admin can also open GitHub from
 keeps Save changes visible until confirmation. Admins can review requests and
 disconnect the server connection.
 
-Operator-issued links without an agent target only connect repos to the
-workspace. In that fallback, agents remain in legacy GitHub mode until an
-admin stages grants with
-`daimon github grants stage --tenant <workspace-uuid> --agent <agent-uuid> --repo <repository-id>` (add `--working` to make it the working repo)
-and runs `daimon github grants activate --tenant <workspace-uuid> --agent <agent-uuid>`.
-Use `grants list`, `remove`, and `deactivate` with the same tenant and agent options.
-While app mode is active, `grants stage` updates access immediately. Existing
+Operator-issued links without an agent target connect repos to the workspace.
+An admin grants one to an agent with
+`daimon github grants add --tenant <workspace-uuid> --agent <agent-uuid> --repo <repository-id> --baseline read --ceiling read`.
+Use `grants list` and `remove` with the same tenant and agent options. Existing
 sessions rotate tokens in place when the repository set is unchanged; a changed
 repository set closes the sessions so the next turn mounts the new checkouts.
+
+Before upgrading, run `daimon github retirement-preview`. It lists staged grants
+the migration will delete, and every agent losing a saved key or binding with
+its working repo and whether a live App grant covers it. An uncovered agent
+loses GitHub access until an App grant is connected. The preview also reports
+App token evidence for live sessions and stops if an unapproved agent lacks
+working or private skill repo coverage. Set
+`DAIMON_GITHUB_APP_ONLY_ACCEPTED_LOSS` to a comma-separated list of agent UUIDs
+whose loss is explicitly accepted by the operator. Set the same value for the
+preview and the Alembic migration. With no value, the migration stops before
+deleting rows if any agent would lose access. Both also stop when a retired
+credential points to more than one workspace. A saved key with no workspace
+at all, such as one left by a deleted agent, can't be matched to an owner
+while any live session has no recorded agent, and that stops them too. Once
+every live session names its agent, such a key is retired without restarting
+any session, provided its exact agent UUID is in the accepted list. After
+upgrading, run
+`daimon github cleanup-legacy-vault` to preview retired
+Managed Agents vault credentials. Run it with `--apply` to delete them. Repeated
+runs skip credentials already deleted. This command leaves GitHub Copilot MCP
+credentials configured for `https://api.githubcopilot.com/mcp` alone.
+The migration asks live sessions of agents with retired GitHub credentials to
+start fresh on their next turn; other sessions keep their workspace. Run
+`cleanup-legacy-vault --apply` even after those sessions restart: the migration
+does not revoke vault-side credentials.
+During the rollout window, an old-image process may reuse a marked session if
+it cannot read legacy session metadata, or return a marked active session for
+reuse. Repeated metadata failures can cause repeated reuse until that process
+refreshes. The marker persists, and new code replaces the session on its next
+turn.
+
+**GitHub retirement release gate.** After the migrate job, wait for the MCP
+update and worker refresh. Set `REGION`, `ZONE`, `AR_REPO` and
+`EXPECTED_DAIMON_IMAGE` to that deploy's values on the deploy runner. Check
+every traffic-bearing or tagged MCP revision, then connect to the worker VM:
+
+```bash
+set -e
+mcp_revisions=$(gcloud run services describe "${AR_REPO}-mcp" --region "$REGION" --format=json |
+  jq -r '.status.traffic[] | select((.percent // 0) > 0 or .tag != null) | .revisionName')
+test -n "$mcp_revisions"
+while IFS= read -r revision; do
+  image=$(gcloud run revisions describe "$revision" --region "$REGION" \
+    --format='value(spec.containers[0].image)')
+  printf '%s %s\n' "$revision" "$image"
+  test "$image" = "$EXPECTED_DAIMON_IMAGE" || exit 1
+done <<< "$mcp_revisions"
+gcloud compute ssh "${AR_REPO}-workers" --zone "$ZONE" --tunnel-through-iap
+```
+
+In that SSH shell, set `EXPECTED_DAIMON_IMAGE` to the same image and check
+every running worker container:
+
+```bash
+set -e
+cd /etc/daimon
+expected_id=$(sudo docker image inspect "$EXPECTED_DAIMON_IMAGE" --format '{{.Id}}')
+containers=$(sudo docker compose -f compose.worker.yml ps -q)
+test -n "$containers"
+for container in $containers; do
+  image_id=$(sudo docker inspect "$container" --format '{{.Image}}')
+  name=$(sudo docker inspect "$container" --format '{{.Name}}')
+  printf '%s %s\n' "$name" "$image_id"
+  test "$image_id" = "$expected_id" || exit 1
+done
+```
+
+Every printed MCP revision must show `EXPECTED_DAIMON_IMAGE`; every printed
+worker must show `expected_id`. Migration 0105 records each marked session's
+original `ma_session_id` and marking time in
+`github_retirement_session_audit`. After in-flight turns drain, run both
+read-only queries. The first finds any recorded turn outcome, regardless of
+reason, that started on the original session after the mark:
+
+```sql
+SELECT a.thread_session_id, a.ma_session_id, a.marked_at,
+       o.id AS turn_outcome_id, o.started_at, o.reason
+FROM github_retirement_session_audit AS a
+JOIN turn_outcomes AS o
+  ON o.session_id = a.ma_session_id AND o.started_at > a.marked_at
+ORDER BY a.thread_session_id, o.started_at;
+```
+
+The second lists marked original mappings still live on the same session:
+
+```sql
+SELECT a.thread_session_id, a.ma_session_id, a.marked_at
+FROM github_retirement_session_audit AS a
+JOIN thread_sessions AS s ON s.id = a.thread_session_id
+WHERE s.status = 'live' AND s.ma_session_id = a.ma_session_id
+ORDER BY a.thread_session_id;
+```
+
+Expected result for each query: zero rows. A row in the second query means
+replacement is still pending; it does not itself show reuse. `started_at`
+comes from turn creation (`packages/core/daimon/core/turn/outcomes.py:92-94`),
+is copied into the outcome at finish (`:264-276`), and is stored later
+(`:325-330`); it is not the database insertion time. Consider the old-process
+window closed only after the image checks and both queries pass.
+The outcome writer is best effort (`turn/outcomes.py:47-60,325-330`), so an
+empty first query rules out recorded post-mark turns, not unrecorded ones.
 
 ## Microsoft Teams (optional)
 
@@ -289,7 +570,7 @@ You need:
 | Register the app in Entra | Anyone, if your organisation lets users register apps; otherwise the Application Developer role |
 | Create the Azure Bot | Contributor (or Owner) on the subscription or a resource group |
 | Upload the app to Teams | A Teams administrator, or anyone if custom app uploads are allowed |
-| Turn on channel files (optional) | A global administrator (or Privileged Role Administrator) to consent once, then a SharePoint or global admin who is a member of the channel |
+| Turn on channel files (optional) | A global administrator (or Privileged Role Administrator) to consent once |
 
 ### 1. Register the app in Entra
 
@@ -310,8 +591,15 @@ This registration is the identity Daimon signs in as.
 
 You don't need to add any API permissions here. The bot reads channels
 through a team-level permission that a team owner grants when they add the
-app (more on that in step 7). Only the optional channel files need a Graph
-permission.
+app (more on that in step 7), and group chats through a chat-level one
+(`ChatMessage.Read.Chat`) granted when the app is added to the chat. Only two optional features need a Graph
+application permission: channel files (`Files.ReadWrite.All`) and private and
+shared channel messages (`ChannelMessage.Read.All`, which is tenant-wide; see
+[below](#private-and-shared-channels-optional)).
+The same team-level consent covers activity feed notices
+(`TeamsActivity.Send.Group`). A team that added a package from before 0.6.0 needs the
+rebuilt one uploaded again (see Updating the app) and an owner to accept it;
+until then its notices are refused and only logged.
 
 ### 2. Create the Azure Bot and connect it to Teams
 
@@ -342,11 +630,13 @@ az bot msteams create -g <resource-group> -n <bot-name>
 
 ### 3. Run the Teams service
 
-**Find your admins.** Teams doesn't tell bots who its admins are, so you list
-Daimon's admins yourself, by their Entra object ID: Entra → **Users** → pick
-the person → copy **Object ID**. Admins can create routines, mint
-coding-tool tokens, replace shared keys, top up and see everyone's usage.
-Anyone can create an agent. You can change the list later.
+**Pick your admin team.** The owners of one team are Daimon's admins: they
+can create routines, mint coding-tool tokens, replace shared keys, top up and
+see everyone's usage. Anyone can create an agent. In Teams, open the team's
+⋯ → **Get link to team** and copy the `groupId` parameter from the link. Once
+the service runs, add the app to that team (step 7). To add or remove an
+admin later, change the team's owners; no redeploy. A removed owner loses
+admin within about a minute, everywhere, routines and tools included.
 
 **Add the values to `.env`:**
 
@@ -354,7 +644,7 @@ Anyone can create an agent. You can change the list later.
 DAIMON_TEAMS__CLIENT_ID=<application (client) ID>
 DAIMON_TEAMS__TENANT_ID=<directory (tenant) ID>
 DAIMON_TEAMS__CLIENT_SECRET=<client secret value>
-DAIMON_TEAMS__ADMIN_USER_IDS=["<object ID>","<another object ID>"]
+DAIMON_TEAMS__ADMIN_TEAM_ID=<groupId of the admin team>
 ```
 
 A few things to know:
@@ -362,7 +652,9 @@ A few things to know:
 - **Set the three credentials together.** Once any `DAIMON_TEAMS__` value is
   set, every Daimon process expects the full set. A half-filled block stops
   them all from starting, not just Teams.
-- **The admin list is a JSON array**, not a comma-separated list.
+- **Admins are the admin team's owners.** `DAIMON_TEAMS__ADMIN_USER_IDS` is
+  no longer read, and a leftover value is ignored: make those people owners
+  of the admin team.
 - **`DAIMON_CRYPTO__KEYS` must be set** (see step 1 of this guide).
 - **The `mcp` service reads these same values**, because the agent's Teams
   tools (posting, reading channels, sending files) run there. With Compose,
@@ -384,7 +676,7 @@ over HTTPS. Any reverse proxy or tunnel works. With
 
 ```text
 teams.example.com {
-	@teams path /api/messages /healthz /readyz /oauth/teams/files/callback
+	@teams path /api/messages /healthz /readyz
 	handle @teams {
 		reverse_proxy 127.0.0.1:3978
 	}
@@ -423,7 +715,8 @@ Teams installs apps from a zip file holding three files at its top level:
 
 The manifest template is
 [`teams-app-manifest.yaml`](teams-app-manifest.yaml), in manifest version
-1.25 so the app can be added to private and shared channels. Fill in your client ID
+1.30 so the app can be added to private and shared channels and answer
+privately in a thread. Fill in your client ID
 and hostname and convert it to JSON. From the repository root, with any
 Python 3 that has PyYAML:
 
@@ -485,15 +778,18 @@ your apps** → **Upload an app**.
   bot reads the thread it is asked about. The bot then posts a welcome in
   the team. To ask it something, @mention it in a post or a reply. Pick the
   name from the autocomplete list so it turns into a highlighted mention:
-  typed text alone doesn't count.
+  typed text alone doesn't count. Add it to the admin team too, or nobody
+  is an admin.
 - **A private or shared channel:** adding the app to the team doesn't add it
   there. The channel's owner adds it from the channel itself, in the
   channel's apps settings. A package built from an
   older template, before manifest 1.25, can't be added to these channels:
   rebuild it and upload it again (see Updating the app).
 
-Group chats aren't supported: the package doesn't offer them, and the bot
-turns away any that reach it.
+- **A group chat:** add the app from the chat's apps, and allow it to read
+  the chat's messages (`ChatMessage.Read.Chat`) when asked. The bot answers
+  there only while everyone in the chat is from your organisation. See
+  [`teams.md`](teams.md#group-chats).
 
 ### People from another organisation (optional)
 
@@ -545,26 +841,14 @@ those files and save its own outputs to the channel's Files tab:
 
 1. Entra → **App registrations** → your app → **API permissions** → **Add a
    permission** → **Microsoft Graph** → **Application permissions** →
-   `Sites.Selected` → **Grant admin consent**. This permission reaches only
-   the sites you grant one by one, not every site in the organisation.
-2. Same app → **Authentication** → **Add a platform** → **Web**, with the
-   redirect URI `https://teams.example.com/oauth/teams/files/callback`.
-3. Set `DAIMON_TEAMS__PUBLIC_URL=https://teams.example.com` in `.env` (your
-   hostname, without `/api/messages`) and run
-   `docker compose --profile teams up -d` so the service picks it up.
-4. In the channel, a Daimon admin asks the bot to turn files on ("enable
-   files in this channel"), or shares a file it can't open, and the bot posts
-   an **Enable files** card. Click it and sign in as a SharePoint or global
-   admin who is a member of that channel. The first sign-in in your
-   organisation must be a global admin, who approves this for everyone.
-   Daimon then grants itself access to that channel's site, and the next
-   message can read the file.
+   `Files.ReadWrite.All` → **Grant admin consent**. No restart is needed:
+   each channel's files turn on within 10 minutes.
 
-One sign-in covers a team's standard channels, which share its site; each
-private or shared channel is turned on from inside it. Open a new channel's
-Files tab once first. A shared channel hosted by another organisation keeps
-its files there, out of reach. [`teams.md`](teams.md#channel-files-optional)
-also shows how to grant a team's site by hand.
+This one permission covers every channel, private and shared ones included.
+It reaches every file in your organisation, so Daimon only opens a shared
+file inside the channel's own Files folder and only saves there. Open a new
+channel's Files tab once first. A shared channel hosted by another
+organisation keeps its files there, out of reach.
 
 ### Private and shared channels (optional)
 
@@ -592,8 +876,13 @@ Details are in [`teams.md`](teams.md#private-and-shared-channels-optional).
 - **A Reply on a bot message gets no answer in a private channel:** Teams
   sends the bot only the private channel posts that @mention it. Mention it.
 - **Every Daimon process fails at startup after adding Teams:** a
-  `DAIMON_TEAMS__` value is missing, or `DAIMON_TEAMS__ADMIN_USER_IDS` isn't
-  a JSON array of object IDs.
+  `DAIMON_TEAMS__` value is missing, or `DAIMON_TEAMS__ADMIN_TEAM_ID` isn't a
+  group ID.
+- **Nobody is an admin:** `DAIMON_TEAMS__ADMIN_TEAM_ID` is unset, or the app
+  isn't installed in that team (`teams.admin_team.lookup_failed` in the logs
+  gives the reason and status). After a failed read the last owners count for
+  up to an hour; once no owner list has been read within an hour, nobody is
+  an admin until the next good read. Re-adding the app restores the owners.
 - **`teams.tenant_reconcile_failed` in the logs:** Daimon couldn't finish
   setting up your organisation, and it refuses turns until it does. The log
   line says why.
@@ -607,7 +896,9 @@ Changes to the manifest only reach Teams in a new package. Bump `version` in
 `manifest.json`, zip it again and upload it over the existing app in the
 Teams admin center (the app → **Upload file**). Teams that already have the
 app pick up the update, and a team owner may be asked to accept new
-permissions.
+permissions. A package from before template version 0.6.0 has no `/`
+commands, prompt starters, private messages to Daimon, group chats or
+activity feed notices: rebuild it.
 
 ## Claude Code login mounts
 

@@ -2,9 +2,9 @@
 
 Mirrors Discord's and Slack's `/here` with the shared card
 (`daimon.core.here_card`). Typed in a channel post it describes that post's
-thread and is answered in the 1:1 chat; typed in the chat it describes the
-chat, or the setup conversation it is switched into. The bot heard the message,
-so it and the sender can both view the place.
+thread, answered there for the sender only (or in the 1:1 chat); typed in the
+chat it describes the chat, or the setup conversation it is switched into. The
+bot heard the message, so it and the sender can both view the place.
 
 Only the place itself counts as visible to the caller: listing which other
 channels they can see takes Graph lookups per team, so an agent rule's other
@@ -49,7 +49,6 @@ async def _load(context: CommandContext) -> HereCard:
     runtime, asked = context.runtime, context.asked_in or context.inbound
     # A plain 1:1 chat is its own thread; only a post or a setup conversation is one.
     thread_id = asked.thread_id if asked.thread_id != asked.channel_id else None
-    github = runtime.settings.github
     public_url = runtime.settings.mcp.public_url
     async with runtime.sessionmaker() as session:
         principal = await find_platform_principal(
@@ -64,11 +63,11 @@ async def _load(context: CommandContext) -> HereCard:
             thread_id=thread_id,
             default=runtime.deployment_default,
             github=GitHubDeploymentFacts(
-                has_fallback_pat=github.fallback_pat is not None,
-                app_configured=github.app_id is not None and github.app_private_key is not None,
+                app_configured=runtime.settings.github_app.app_id is not None
+                and runtime.settings.github_app.private_key is not None,
             ),
             public_mcp_url=str(public_url) if public_url is not None else None,
-            # Answered in the caller's own 1:1 chat, so an admin may see admin views.
+            # Only the caller sees the answer, so an admin may see admin views.
             is_admin=context.is_admin,
             caller_account_id=principal.account_id if principal else None,
             visible_channel_ids={asked.channel_id},

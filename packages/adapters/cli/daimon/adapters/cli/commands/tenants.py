@@ -15,11 +15,12 @@ from daimon.adapters.cli.flags import JSON_OPTION, YES_OPTION
 from daimon.adapters.cli.output import emit_rows, render_json
 from daimon.adapters.cli.prompt import confirm_or_abort
 from daimon.adapters.cli.runtime import CliRuntime, build_runtime
-from daimon.core import channel_admins, channel_backend
+from daimon.core import channel_backend
 from daimon.core.access_policy import OPEN_ACCESS_POLICY, TenantAccessPolicy
 from daimon.core.config import load_settings
 from daimon.core.errors import StoreError
 from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.native_admins import verify_backend_actor
 from daimon.core.permissions import (
     ChannelReaders,
     ChannelRule,
@@ -157,7 +158,7 @@ async def tenants_backend_policy(
     service = channel_backend.make_backend_service(rt.sessionmaker, rt.settings.turn)
 
     async def actor() -> channel_backend.BackendActor:
-        return await channel_admins.verify_backend_actor(
+        return await verify_backend_actor(
             rt.sessionmaker,
             tenant_id=tenant_id,
             platform_user_id=actor_user,
@@ -326,7 +327,7 @@ async def tenants_delete(
             f"tenant_ledger={counts.tenant_ledger}, "
             f"tenant_user_caps={counts.tenant_user_caps}, "
             f"agent_files={counts.agent_files}, "
-            f"agent_repo_binding={counts.agent_repo_binding}, "
+            f"agent_github_grants={counts.agent_github_grants}, "
             f"tenant_config={counts.tenant_config}, "
             f"channel_config={counts.channel_config}"
         )
@@ -340,7 +341,7 @@ async def tenants_delete(
             f"tenant_ledger={counts.tenant_ledger}, "
             f"tenant_user_caps={counts.tenant_user_caps}, "
             f"agent_files={counts.agent_files}, "
-            f"agent_repo_binding={counts.agent_repo_binding}, "
+            f"agent_github_grants={counts.agent_github_grants}, "
             f"tenant_config={counts.tenant_config}, "
             f"channel_config={counts.channel_config}"
         )

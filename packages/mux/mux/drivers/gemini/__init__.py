@@ -19,7 +19,7 @@ from mux.drivers.gemini.core import (
     GeminiSessions,
     page_values,
 )
-from mux.drivers.gemini.mcp_auth import MCPSecretResolver
+from mux.drivers.gemini.mcp_auth import GCSSecretResolver, MCPSecretResolver
 from mux.drivers.gemini.resources import GeminiArtifacts, GeminiSkills
 from mux.drivers.gemini.skill_deployment import SkillBundlePublisher
 from mux.drivers.gemini.storage import Storage
@@ -62,17 +62,20 @@ class GeminiManagedAgents:
         account_scope_id: str,
         model_for_interaction: Callable[[str], ModelRef | None] | None = None,
         mcp_secrets: MCPSecretResolver | None = None,
+        gcs_secrets: GCSSecretResolver | None = None,
         skill_bundle_publisher: SkillBundlePublisher | None = None,
         resource_catalog_enabled: bool = False,
         resource_catalog_transport: AgentCatalogTransport | None = None,
         native_agent: Agent | None = None,
         max_total_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        max_input_tokens: int | None = None,
     ) -> None:
         if type(resource_catalog_enabled) is not bool:
             raise ValueError("resource catalog capability must be an explicit bool")
         if max_output_tokens is not None and (
-            native_agent is not None or resource_catalog_enabled or max_total_tokens is not None
+            ((native_agent is not None or resource_catalog_enabled) and max_input_tokens is None)
+            or max_total_tokens is not None
         ):
             raise UnsupportedCapability(("model_interaction_resources",), PROFILE.profile_id)
         self.catalog_adapter: GeminiCatalogAdapter | None = None
@@ -82,7 +85,12 @@ class GeminiManagedAgents:
                     ("gemini_resource_catalog_transport",), PROFILE.profile_id
                 )
             self.catalog_adapter = GeminiCatalogAdapter(
-                transport, storage, account_scope_id, resource_catalog_transport, enabled=True
+                transport,
+                storage,
+                account_scope_id,
+                resource_catalog_transport,
+                enabled=True,
+                mcp_secrets=mcp_secrets,
             )
         self.agents = self.catalog_adapter or GeminiAgents(
             transport, storage, account_scope_id, mcp_secrets=mcp_secrets
@@ -94,8 +102,10 @@ class GeminiManagedAgents:
             account_scope_id,
             mcp_secrets=mcp_secrets,
             native_agent=native_agent,
+            gcs_secrets=gcs_secrets,
             max_total_tokens=max_total_tokens,
             max_output_tokens=max_output_tokens,
+            max_input_tokens=max_input_tokens,
         )
         self.events = GeminiEvents(
             transport,
@@ -104,9 +114,11 @@ class GeminiManagedAgents:
             state_store=state_store,
             model_for_interaction=model_for_interaction,
             native_agent=native_agent,
+            gcs_secrets=gcs_secrets,
             mcp_secrets=mcp_secrets,
             max_total_tokens=max_total_tokens,
             max_output_tokens=max_output_tokens,
+            max_input_tokens=max_input_tokens,
         )
         self.usage = GeminiUsage(transport, storage, account_scope_id)
         self.artifacts = GeminiArtifacts(transport, storage, account_scope_id)

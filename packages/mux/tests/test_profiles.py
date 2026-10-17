@@ -173,7 +173,7 @@ def test_resource_profile_native_projection_preserves_authored_intent() -> None:
         == authored.tools
     )
     assert PERSISTENT_WORKSPACE.execution_tool == "bash"
-    assert PERSISTENT_WORKSPACE.skill_digest is None
+    assert PERSISTENT_WORKSPACE.skill_digest == "content"
     assert PERSISTENT_WORKSPACE.support_for("agent_delete") == "native"
     assert INLINE_REUSE.execution_tool == "code_execution"
     assert INLINE_REUSE.skill_digest == "version"
@@ -262,3 +262,96 @@ def test_native_agent_tool_projection_uses_the_closed_anthropic_compiler():
         agent_tools(
             extension.model_copy(update={"value": {"tools": [{"type": "unknown_toolset"}]}})
         )
+
+
+def test_conversation_worker_is_explicit_without_changing_openai_selection():
+    from mux.profiles import (
+        CONVERSATION_ONLY,
+        RUNNABLE_PROFILES,
+        backend_selection,
+        runnable_selection,
+    )
+
+    selected = backend_selection("openai")
+    assert selected.profile == PERSISTENT_WORKSPACE.profile_id
+    conversation = selected.model_copy(update={"profile": CONVERSATION_ONLY.profile_id})
+    assert conversation.profile in RUNNABLE_PROFILES and runnable_selection(conversation)
+    assert not runnable_selection(conversation.model_copy(update={"model": "unapproved-model"}))
+    assert not runnable_selection(conversation.model_copy(update={"thread_mode": "shared"}))
+    assert neutral_catalog_profile_for("openai") is PERSISTENT_WORKSPACE
+    assert (
+        neutral_catalog_profile_for("openai", profile_id=CONVERSATION_ONLY.profile_id)
+        is CONVERSATION_ONLY
+    )
+    assert neutral_catalog_profile_for("gemini", profile_id=CONVERSATION_ONLY.profile_id) is None
+
+
+@pytest.mark.parametrize(
+    "names", [("read",), ("read", "grep", "glob"), ("read", "edit", "grep", "glob", "write")]
+)
+def test_execution_mapping_refuses_restricted_filesystem_authority(names):
+    from mux.profiles import represented_execution_tools
+
+    with pytest.raises(InvalidConfig):
+        represented_execution_tools(
+            INLINE_REUSE, tuple(ToolSpec(name=n, kind="builtin") for n in names)
+        )
+
+
+def test_execution_mapping_requires_complete_automatic_authority():
+    from mux.profiles import represented_execution_tools
+
+    tools = tuple(
+        ToolSpec(name=n, kind="builtin") for n in ("bash", "read", "edit", "grep", "glob", "write")
+    )
+    assert represented_execution_tools(INLINE_REUSE, tools) == (
+        ToolSpec(name="code_execution", kind="builtin"),
+    )
+    for permission in ("ask",):
+        with pytest.raises(InvalidConfig):
+            represented_execution_tools(
+                INLINE_REUSE, (tools[0].model_copy(update={"permission": permission}), *tools[1:])
+            )
+
+
+@pytest.mark.parametrize("disabled", ["bash", "write", "edit"])
+def test_native_disabled_capability_cannot_acquire_general_execution(disabled):
+    from mux.drivers.anthropic.schemas import AgentToolsConfig
+    from mux.profiles import represented_execution_tools
+
+    source = AgentToolsConfig.model_validate(
+        {
+            "tools": [
+                {
+                    "type": "agent_toolset_20260401",
+                    "default_config": {
+                        "enabled": False,
+                        "permission_policy": {"type": "always_allow"},
+                    },
+                    "configs": [
+                        {"name": name, "enabled": name != disabled}
+                        for name in ("bash", "read", "edit", "grep", "glob", "write")
+                    ],
+                }
+            ]
+        }
+    )
+    with pytest.raises(InvalidConfig):
+        represented_execution_tools(INLINE_REUSE, source.intent(exact=True))
+
+
+@pytest.mark.parametrize("web", [("web_fetch",), ("web_search",), ("web_fetch", "web_search")])
+def test_enabled_native_web_authority_is_preserved_by_execution_mapping(web):
+    from mux.profiles import represented_execution_tools
+
+    tools = tuple(
+        ToolSpec(name=name, kind="builtin")
+        for name in ("bash", "read", "edit", "grep", "glob", "write", *web)
+    )
+    mapped = represented_execution_tools(INLINE_REUSE, tools)
+    expected = (
+        {"code_execution"}
+        | ({"url_context"} if "web_fetch" in web else set())
+        | ({"google_search"} if "web_search" in web else set())
+    )
+    assert {tool.name for tool in mapped} == expected

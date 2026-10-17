@@ -32,6 +32,26 @@ def get_profile(profile_id: str) -> Profile:
         raise InvalidConfig(f"unknown profile {profile_id!r}") from None
 
 
+def worker_token_limits_supported(
+    profile: Profile,
+    *,
+    max_input_tokens: int | None,
+    max_output_tokens: int | None,
+    max_turns: int,
+) -> bool:
+    """Profile-specific envelope shape; capability admission stays with the caller."""
+    if profile.profile_id != INLINE_REUSE.profile_id or (
+        max_input_tokens is None and max_output_tokens is None
+    ):
+        return True
+    return (
+        max_input_tokens is not None
+        and max_output_tokens is not None
+        and max_turns == 1
+        and max_output_tokens <= 65_536
+    )
+
+
 def emits_legacy_events_for(provider: Provider) -> bool:
     """Read rendering policy for an event or resource without a profile id.
 
@@ -46,16 +66,65 @@ def emits_legacy_events_for(provider: Provider) -> bool:
     return declarations.pop()
 
 
-def neutral_catalog_profile_for(provider: str) -> Profile | None:
-    """The declared catalog profile, without assuming all provider profiles support it."""
+def neutral_catalog_profile_for(provider: str, *, profile_id: str | None = None) -> Profile | None:
+    """Select catalog support, requiring opt-in for explicitly named extra profiles.
+
+    Provider-only callers keep their existing unambiguous resource profile;
+    a host with a selected profile must retain that exact profile instead.
+    """
     matches = tuple(
         profile
         for profile in PROFILES.values()
-        if profile.provider == provider and profile.support_for("neutral_catalog") in SUPPORTED
+        if profile.provider == provider
+        and (
+            profile.profile_id == profile_id
+            if profile_id is not None
+            else profile.profile_id
+            not in {
+                explicit
+                for selection in _BACKEND_SELECTIONS.values()
+                for explicit in selection.profiles
+            }
+        )
+        and profile.support_for("neutral_catalog") in SUPPORTED
     )
     if len(matches) > 1:
         raise InvalidConfig("provider has ambiguous neutral catalog profiles")
     return matches[0] if matches else None
+
+
+def represented_execution_tools(
+    profile: Profile, tools: tuple[ToolSpec, ...]
+) -> tuple[ToolSpec, ...]:
+    """Map supported filesystem capabilities through the profile's execution tool.
+
+    MCP remains a separate capability. Unknown tools and permission prompts
+    cannot acquire an execution mapping by resembling a known tool name.
+    """
+    if profile.profile_id not in (INLINE_REUSE.profile_id, PERSISTENT_WORKSPACE.profile_id):
+        raise InvalidConfig("profile has no source execution mapping")
+    names = {"bash", "read", "edit", "grep", "glob", "write"}
+    web_tools = (
+        {"web_fetch": "url_context", "web_search": "google_search"}
+        if profile.profile_id == INLINE_REUSE.profile_id
+        else {"web_search": "web_search"}
+    )
+    actual = {tool.name for tool in tools}
+    if (
+        len(tools) != len(actual)
+        or not names.issubset(actual)
+        or not actual.issubset(names | web_tools.keys())
+        or any(tool.kind != "builtin" or tool.permission != "auto" for tool in tools)
+    ):
+        raise InvalidConfig("source execution tools are not representable")
+    return (
+        ToolSpec(name=profile.execution_tool, kind="builtin"),
+        *(
+            ToolSpec(name=target, kind="builtin")
+            for source, target in web_tools.items()
+            if source in actual
+        ),
+    )
 
 
 def native_agent_tools(profile: Profile, spec: AgentSpec) -> tuple[ToolSpec, ...]:
@@ -98,6 +167,7 @@ __all__ = [
     "PERSISTENT_WORKSPACE",
     "PROFILES",
     "get_profile",
+    "worker_token_limits_supported",
     "emits_legacy_events_for",
     "native_agent_tools",
     "neutral_catalog_profile_for",
@@ -110,6 +180,7 @@ class BackendSelection:
     config: BackendConfig
     thread_modes: tuple[ThreadMode, ...]
     allowed_models: tuple[str, ...] | None = None
+    profiles: tuple[str, ...] = ()
 
 
 _BACKEND_SELECTIONS: Mapping[Provider, BackendSelection] = {
@@ -117,6 +188,7 @@ _BACKEND_SELECTIONS: Mapping[Provider, BackendSelection] = {
     "openai": BackendSelection(
         BackendConfig(backend="openai", profile="openai.persistent_workspace", model="gpt-6-luna"),
         ("per_caller",),
+        profiles=(CONVERSATION_ONLY.profile_id,),
     ),
     "gemini": BackendSelection(
         BackendConfig(backend="gemini", profile="gemini.inline_reuse", model="gemini-3.8-flash"),
@@ -125,7 +197,9 @@ _BACKEND_SELECTIONS: Mapping[Provider, BackendSelection] = {
     ),
 }
 RUNNABLE_PROFILES: frozenset[str] = frozenset(
-    resolve_default(selection.config).profile for selection in _BACKEND_SELECTIONS.values()
+    profile
+    for selection in _BACKEND_SELECTIONS.values()
+    for profile in (resolve_default(selection.config).profile, *selection.profiles)
 )
 
 
@@ -148,7 +222,7 @@ def runnable_selection(selection: ResolvedBackend) -> bool:
     declared = _BACKEND_SELECTIONS[selection.backend]
     resolved = resolve_default(declared.config)
     return (
-        selection.profile == resolved.profile
+        selection.profile in (resolved.profile, *declared.profiles)
         and (
             selection.model == resolved.model or selection.model in (declared.allowed_models or ())
         )

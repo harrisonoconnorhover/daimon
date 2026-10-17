@@ -115,16 +115,14 @@ from daimon.core.memory_resource import (
     sweep_erased_personal_memory,
 )
 from daimon.core.stores import accounts as accounts_store
-from daimon.core.stores import agent_github_binding as agent_github_binding_store
 from daimon.core.stores import agent_posts as agent_posts_store
 from daimon.core.stores import channel_admins as channel_admins_store
 from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import direct_messages as direct_messages_store
+from daimon.core.stores import gemini_runtime_state as gemini_state_store
 from daimon.core.stores import github_connect as github_connect_store
-from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_issued_tokens as github_issued_tokens_store
 from daimon.core.stores import github_links as github_links_store
-from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
 from daimon.core.stores import message_feedback as message_feedback_store
@@ -160,13 +158,11 @@ class PurgeReport(BaseModel):
     user_configs: int = 0
     accounts: int = 0
     user_skills: int = 0
-    github_credentials: int = 0
     github_connect_requests: int = 0
     github_connect_click_intents: int = 0
     github_user_links: int = 0
-    github_oauth_states: int = 0
     mcp_tokens: int = 0
-    agent_github_binding: int = 0
+    gemini_records: int = 0
     slack_user_tokens: int = 0
     slack_turn_contexts: int = 0
     direct_message_conversations: int = 0
@@ -188,15 +184,13 @@ class PurgeReport(BaseModel):
             user_configs=self.user_configs + other.user_configs,
             accounts=self.accounts + other.accounts,
             user_skills=self.user_skills + other.user_skills,
-            github_credentials=self.github_credentials + other.github_credentials,
             github_connect_requests=self.github_connect_requests + other.github_connect_requests,
             github_connect_click_intents=(
                 self.github_connect_click_intents + other.github_connect_click_intents
             ),
             github_user_links=self.github_user_links + other.github_user_links,
-            github_oauth_states=self.github_oauth_states + other.github_oauth_states,
             mcp_tokens=self.mcp_tokens + other.mcp_tokens,
-            agent_github_binding=self.agent_github_binding + other.agent_github_binding,
+            gemini_records=self.gemini_records + other.gemini_records,
             slack_user_tokens=self.slack_user_tokens + other.slack_user_tokens,
             slack_turn_contexts=self.slack_turn_contexts + other.slack_turn_contexts,
             direct_message_conversations=(
@@ -243,19 +237,6 @@ async def _purge_principal_in_session(
             external_id=principal.external_id,
         )
         kind: Literal["cli", "platform"] = "platform"
-        # Platform principals have oauth-state rows keyed (platform, external_id).
-        # tenant_id is required: external_id is NOT globally unique across
-        # platforms — Slack user ids are workspace-scoped, so `U123` in two
-        # workspaces are two different humans. A tenant-agnostic delete would
-        # erase another tenant's in-flight (10-min-TTL) handshake rows. The
-        # narrow "ghost rows under a stale tenant_id" completeness gap
-        # (re-key drift) is accepted — those rows expire unused.
-        oauth_states_count = await github_oauth_states_store.delete_states_for_platform_user(
-            session,
-            platform=principal.platform,
-            platform_user_id=principal.external_id,
-            tenant_id=principal.tenant_id,
-        )
         # credential_requests carries the same non-globally-unique
         # platform_user_id caveat as oauth_states above — always tenant-scoped.
         credential_requests_count = (
@@ -319,22 +300,6 @@ async def _purge_principal_in_session(
     else:
         routines_count = 0
         kind = "cli"
-        # The CLI auth flow writes oauth-state rows with platform="cli",
-        # platform_user_id=<os_user> (adapters/cli/commands/auth.py). Both
-        # principal kinds own rows in the tables where the schema permits it —
-        # CLI principals are included.
-        # tenant_id scoping is a deliberate carve-out: os_user is NOT
-        # globally unique (two unrelated people can both be `ubuntu`), so a
-        # tenant-agnostic delete would erase another account's handshake rows.
-        # Trade-off accepted: cli handshake ghost rows stranded under a stale
-        # tenant_id are left for a separate sweep (they expire from use after
-        # the 10-minute TTL and never join back to a principal).
-        oauth_states_count = await github_oauth_states_store.delete_states_for_platform_user(
-            session,
-            platform="cli",
-            platform_user_id=principal.os_user,
-            tenant_id=principal.tenant_id,
-        )
         # CLI principals never own credential_requests rows in practice (the
         # credential button flow is Discord-only), so this always reports 0 —
         # kept for symmetry with the platform branch and future-proofing.
@@ -365,15 +330,7 @@ async def _purge_principal_in_session(
         support_escalations_count = 0
         channel_admins_count = 0
 
-    # user_skills and github_credentials are keyed by principal_id alone — both
-    # principal kinds own rows in these tables.
     user_skills_count = await user_skills_store.delete_user_skills_for_principal(
-        session, principal_id=principal.id
-    )
-    github_credentials_count = await github_credentials_store.delete_credential_for_principal(
-        session, principal_id=principal.id
-    )
-    agent_github_binding_count = await agent_github_binding_store.delete_for_principal(
         session, principal_id=principal.id
     )
 
@@ -422,9 +379,6 @@ async def _purge_principal_in_session(
         cli_principals=principal_count if kind == "cli" else 0,
         platform_principals=principal_count if kind == "platform" else 0,
         user_skills=user_skills_count,
-        github_credentials=github_credentials_count,
-        github_oauth_states=oauth_states_count,
-        agent_github_binding=agent_github_binding_count,
         slack_user_tokens=slack_user_tokens_count,
         credential_requests=credential_requests_count,
         wizard_sessions=wizard_sessions_count,
@@ -540,6 +494,12 @@ async def purge_account(
             sub = await _purge_principal_in_session(session, principal=principal)
             report = report.merge(sub)
 
+        # Conversation/artifact records are purged. Conservative holds contain
+        # financial attempt metadata, not conversation payload; retain them as
+        # audit evidence rather than replenishing a cap when an account is erased.
+        gemini_records_count = await gemini_state_store.delete_records_for_account(
+            session, account_id=account_id
+        )
         # Account-scoped (keyed by account_id, not principal): delete the
         # per-agent MCP token rows BEFORE delete_account — they reference
         # accounts.id, so leaving them trips the FK and rolls back the purge.
@@ -600,6 +560,7 @@ async def purge_account(
         db_report = report.merge(
             PurgeReport(
                 mcp_tokens=mcp_tokens_count,
+                gemini_records=gemini_records_count,
                 github_connect_requests=github_connect_requests_count,
                 github_connect_click_intents=github_connect_click_intents_count,
                 message_feedback=message_feedback_count,

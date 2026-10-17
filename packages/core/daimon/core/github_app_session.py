@@ -29,8 +29,11 @@ from daimon.core.github_app_auth import (
     mint_installation_token,
 )
 from daimon.core.github_requester_access import PermissionCache
-from daimon.core.mcp_auth import mint_jwt
-from daimon.core.mcp_vault import GITHUB_COPILOT_MCP_URL, add_github_copilot_credential
+from daimon.core.mcp_vault import (
+    GITHUB_COPILOT_MCP_URL,
+    add_github_copilot_credential,
+    chat_mcp_credential,
+)
 from daimon.core.mux_backend import resource_scope
 from daimon.core.mux_compat import (
     archive_session,
@@ -50,6 +53,8 @@ from daimon.core.stores.github_access import (
     list_live_grant_repositories,
     lock_agent_grants,
 )
+from daimon.core.stores.github_app_installations import get as get_installation
+from daimon.core.stores.github_installation_reconciliation import enqueue as enqueue_reconciliation
 from daimon.core.stores.github_issued_tokens import (
     GitHubTokenRowClosedError,
     create_pending,
@@ -67,6 +72,7 @@ from daimon.core.stores.github_issued_tokens import (
     store_token,
 )
 from daimon.core.stores.security_audit import append_github_token_event
+from daimon.core.stores.thread_sessions import record_app_token_refresh
 from daimon.core.turn_origin import current_origin_id
 from mux.contracts.ids import Scope
 from mux.contracts.resources import WorkspaceSource
@@ -90,6 +96,12 @@ class AppSessionAccess:
     resources: tuple[Resource, ...]
     tokens: tuple[AppToken, ...]
     working_token: str | None
+    excluded_repo_urls: tuple[str, ...] = ()
+    token_repo_urls: tuple[str, ...] = ()
+
+
+class GitHubTokenMintUnavailable(RuntimeError):
+    """A retryable App token exchange failure, without GitHub response content."""
 
 
 REQUESTER_CACHE = PermissionCache()
@@ -234,6 +246,7 @@ async def create_session_vault(
     account_id: uuid.UUID | None,
     public_url: str | None,
     jwt_secret: bytes | None,
+    sessionmaker: async_sessionmaker[AsyncSession],
 ) -> str:
     scope = resource_scope(
         tenant_id=str(tenant_id),
@@ -242,23 +255,16 @@ async def create_session_vault(
     vault = await create_vault(anthropic, f"github-session:{uuid.uuid4()}", scope=scope)
     try:
         if public_url is not None and jwt_secret is not None and account_id is not None:
-            await store_credential(
-                anthropic,
-                vault.id,
-                {
-                    "auth": {
-                        "type": "static_bearer",
-                        "mcp_server_url": public_url,
-                        "token": mint_jwt(
-                            account_id=account_id,
-                            chat_agent_id=agent_id,
-                            secret=jwt_secret,
-                            now=datetime.now(UTC),
-                        ),
-                    }
-                },
-                scope=scope,
-            )
+            async with sessionmaker() as session, session.begin():
+                payload = await chat_mcp_credential(
+                    session,
+                    account_id=account_id,
+                    agent_id=agent_id,
+                    jwt_secret=jwt_secret,
+                    public_url=public_url,
+                    now=datetime.now(UTC),
+                )
+                await store_credential(anthropic, vault.id, payload, scope=scope)
     except BaseException:
         await archive_vault(anthropic, vault.id, scope=scope)
         raise
@@ -294,7 +300,13 @@ async def _effective_rows(
             agent_id,
             selected,
         )
-    return [(grant, repo, "write") for grant, repo in by_installation[selected]], None, None
+    rows: list[tuple[AgentGrant, AuthorizedRepo, PermissionProfile]] = []
+    for grant, repo in by_installation[selected]:
+        profile: PermissionProfile = (
+            "write" if grant.ceiling_access == "write" and repo.max_access == "write" else "read"
+        )
+        rows.append((grant, repo, profile))
+    return rows, None, None
 
 
 async def revoke_token(client: httpx.AsyncClient, token: str) -> None:
@@ -311,6 +323,26 @@ async def _declared_repositories(
 ) -> list[tuple[AgentGrant, AuthorizedRepo]]:
     async with sessionmaker() as session:
         return await list_live_grant_repositories(session, tenant_id=tenant_id, agent_id=agent_id)
+
+
+async def _enqueue_mint_failure_reconciliation(
+    session: AsyncSession, *, installation_id: int, now: datetime
+) -> None:
+    """Queue once per installation snapshot, even if several groups fail."""
+    installation = await get_installation(session, installation_id=installation_id)
+    snapshot = (
+        installation.github_refreshed_at.isoformat()
+        if installation is not None and installation.github_refreshed_at is not None
+        else "unrefreshed"
+    )
+    await enqueue_reconciliation(
+        session,
+        installation_id=installation_id,
+        delivery_id=f"mint-failure:{installation_id}:{snapshot}",
+        event="mint_failure",
+        deleted=False,
+        now=now,
+    )
 
 
 async def declared_app_repositories(
@@ -341,6 +373,7 @@ async def prepare_app_access(
     config: GithubAppSettings,
     fernet: MultiFernet | None,
     cache: PermissionCache,
+    excluded_repo_urls: tuple[str, ...] = (),
 ) -> AppSessionAccess:
     """Mint only this session's effective repository groups, recording every token."""
     if is_external:
@@ -361,18 +394,28 @@ async def prepare_app_access(
     )
     if not rows:
         return AppSessionAccess((), (), None)
-    groups = group_repository_access(
-        [(repo.installation_id, repo.repo_id, access) for _, repo, access in rows]
+    repo_urls = {repo.repo_id: f"https://github.com/{repo.repo_full_name}" for _, repo, _ in rows}
+    skipped_repo_ids = {
+        repo.repo_id for _, repo, _ in rows if repo_urls[repo.repo_id] in excluded_repo_urls
+    }
+    active_groups = group_repository_access(
+        [
+            (repo.installation_id, repo.repo_id, access)
+            for _, repo, access in rows
+            if repo.repo_id not in skipped_repo_ids
+        ]
     )
-    groups.sort(key=lambda group: (group[0], group[1], group[2]))
-    if len(groups) + 1 > 15:
+    active_groups.sort(key=lambda group: (group[0], group[1], group[2]))
+    if len(active_groups) + 1 > 15:
         raise ValueError("GitHub App access exceeds the session vault credential limit")
     jwt = build_app_jwt(
         config.private_key.get_secret_value(), config.app_id, now=int(datetime.now(UTC).timestamp())
     )
     tokens: list[AppToken] = []
+    excluded_repo_ids: set[int] = set(skipped_repo_ids)
+    pending_token_id: uuid.UUID | None = None
     try:
-        for installation_id, profile, repo_ids in groups:
+        for installation_id, profile, repo_ids in active_groups:
             versions = {
                 key: version
                 for grant, repo, _ in rows
@@ -398,13 +441,38 @@ async def prepare_app_access(
                     github_user_id=user_id,
                     link_generation=link_generation,
                 )
-            token = await mint_installation_token(
-                client,
-                jwt=jwt,
-                installation_id=installation_id,
-                repository_ids=list(repo_ids),
-                profile=profile,
-            )
+            pending_token_id = pending.token_id
+            try:
+                token = await mint_installation_token(
+                    client,
+                    jwt=jwt,
+                    installation_id=installation_id,
+                    repository_ids=list(repo_ids),
+                    profile=profile,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in (403, 404, 422):
+                    raise GitHubTokenMintUnavailable(
+                        "GitHub access is temporarily unavailable. Try again."
+                    ) from exc
+                async with sessionmaker.begin() as session:
+                    await mark_revoked(session, token_id=pending.token_id)
+                    await _enqueue_mint_failure_reconciliation(
+                        session, installation_id=installation_id, now=datetime.now(UTC)
+                    )
+                pending_token_id = None
+                excluded_repo_ids.update(repo_ids)
+                _log.warning(
+                    "GitHub App token mint could not cover installation %s (HTTP %s)",
+                    installation_id,
+                    exc.response.status_code,
+                )
+                continue
+            except Exception as exc:
+                raise GitHubTokenMintUnavailable(
+                    "GitHub access is temporarily unavailable. Try again."
+                ) from exc
+            pending_token_id = None
             try:
                 async with sessionmaker.begin() as session:
                     await store_token(
@@ -449,6 +517,12 @@ async def prepare_app_access(
             if any(row.token_id == pending.token_id for row in stale):
                 raise ValueError("GitHub access changed during token mint")
     except Exception:
+        if pending_token_id is not None:
+            try:
+                async with sessionmaker.begin() as session:
+                    await mark_revoked(session, token_id=pending_token_id)
+            except Exception:
+                _log.exception("Failed to close pending GitHub token row %s", pending_token_id)
         for issued in tokens:
             try:
                 await revoke_token(client, issued.token)
@@ -459,11 +533,14 @@ async def prepare_app_access(
         raise
     by_repo = {repo_id: item.token for item in tokens for repo_id in item.repo_ids}
     resources: list[Resource] = []
+    available_rows = [
+        (grant, repo, profile) for grant, repo, profile in rows if repo.repo_id in by_repo
+    ]
     mounted = _mounted_repo_ids(
-        [repo.repo_id for _, repo, _ in rows],
+        [repo.repo_id for _, repo, _ in available_rows],
         working_ids={grant.repo_id for grant, _, _ in rows if grant.is_working_repo},
     )
-    for grant, repo, _ in rows:
+    for grant, repo, _ in available_rows:
         if repo.repo_id not in mounted:
             continue
         owner, name = repo.repo_full_name.split("/", 1)
@@ -475,8 +552,26 @@ async def prepare_app_access(
                 "mount_path": grant.mount_path or f"/workspace/{owner}/{name}",
             }
         )
-    working = next((by_repo[grant.repo_id] for grant, _, _ in rows if grant.is_working_repo), None)
-    return AppSessionAccess(tuple(resources), tuple(tokens), working or tokens[0].token)
+    working = next(
+        (by_repo[grant.repo_id] for grant, _, _ in available_rows if grant.is_working_repo), None
+    )
+    excluded = tuple(
+        sorted(
+            f"https://github.com/{repo.repo_full_name}"
+            for _, repo, _ in rows
+            if repo.repo_id in excluded_repo_ids
+        )
+    )
+    token_repo_urls = tuple(
+        sorted(f"https://github.com/{repo.repo_full_name}" for _, repo, _ in available_rows)
+    )
+    return AppSessionAccess(
+        tuple(resources),
+        tuple(tokens),
+        working or (tokens[0].token if tokens else None),
+        excluded,
+        token_repo_urls,
+    )
 
 
 #: The sandbox holds at most one repo: the agent's working repo, chosen in setup.
@@ -825,7 +920,8 @@ async def _rotate_live_app_tokens_unlocked(
     config: GithubAppSettings,
     fernet: MultiFernet,
     active_turn: bool = False,
-) -> None:
+    unavailable_repos: tuple[tuple[str, datetime], ...] = (),
+) -> AppSessionAccess:
     """Refresh resources and vault in place; leave equal-access old tokens to expire."""
     scope = resource_scope(
         tenant_id=str(tenant_id),
@@ -856,6 +952,9 @@ async def _rotate_live_app_tokens_unlocked(
             # running turn alone; the next turn boundary replaces the session.
             _log.warning("No App rollback snapshot for active session %s", session_id)
     async with httpx.AsyncClient() as client:
+        # Rotation never retries a refused repo, even after its 60 minutes: only
+        # the turn-boundary replacement does, so retries stay one per turn.
+        refused = tuple(url for url, _ in unavailable_repos)
         access = await prepare_app_access(
             sessionmaker,
             client,
@@ -867,6 +966,7 @@ async def _rotate_live_app_tokens_unlocked(
             config=config,
             fernet=fernet,
             cache=REQUESTER_CACHE,
+            excluded_repo_urls=refused,
         )
         try:
             for resource in access.resources:
@@ -918,12 +1018,21 @@ async def _rotate_live_app_tokens_unlocked(
                 await lock_agent_grants(session, tenant_id=tenant_id, agent_id=agent_id)
                 if await _access_is_stale(session, access):
                     raise ValueError("GitHub access changed before token retirement")
+                finished_at = datetime.now(UTC)
                 await mark_session_tokens_superseded(
                     session,
                     session_id=session_id,
                     except_ids=frozenset(token.token_id for token in access.tokens),
-                    now=datetime.now(UTC),
+                    now=finished_at,
                 )
+                await record_app_token_refresh(
+                    session,
+                    ma_session_id=session_id,
+                    issued_at=int(finished_at.timestamp()),
+                    access=access,
+                    now=finished_at,
+                )
+            return access
         except Exception:
             kept: frozenset[uuid.UUID] = frozenset()
             try:
@@ -1035,9 +1144,10 @@ async def rotate_live_app_tokens(
     config: GithubAppSettings,
     fernet: MultiFernet,
     active_turn: bool = False,
-) -> None:
+    unavailable_repos: tuple[tuple[str, datetime], ...] = (),
+) -> AppSessionAccess:
     """Rotate without holding a database connection during network calls."""
-    await _rotate_live_app_tokens_unlocked(
+    return await _rotate_live_app_tokens_unlocked(
         anthropic,
         sessionmaker,
         session_id=session_id,
@@ -1050,4 +1160,5 @@ async def rotate_live_app_tokens(
         config=config,
         fernet=fernet,
         active_turn=active_turn,
+        unavailable_repos=unavailable_repos,
     )

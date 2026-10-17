@@ -48,6 +48,7 @@ from daimon.core.confirmation import backend_switch_tools_for_turn
 from daimon.core.defaults.metadata import MA_METADATA_KEY_BUDGET_CHANNEL
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.model_presets import model_choice_id
 from daimon.core.mux_backend import managed_agents, resource_ref
 from daimon.core.mux_compat import legacy_call
 from daimon.core.session_compat import (
@@ -109,6 +110,7 @@ from daimon.core.stores.thread_sessions import (
     get_live_thread_session,
     get_thread_session_by_id,
     mark_session_external,
+    record_snapshot,
     set_budget_channel_stamp,
     update_mutable_fingerprint,
 )
@@ -135,6 +137,26 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 log = structlog.get_logger(__name__)
 
 CONTINUED = ContinuityOutcome()
+
+
+def _with_unavailable_notice(
+    continuity: ContinuityOutcome, urls: tuple[str, ...]
+) -> ContinuityOutcome:
+    if not urls:
+        return continuity
+    return replace(
+        continuity,
+        user_prefix=(
+            continuity.user_prefix
+            + "\n<github_access_notice>GitHub access for these connected repositories is "
+            "unavailable in this session: "
+            + ", ".join(urls)
+            + ". Tell the requester plainly that GitHub access is unavailable for "
+            "those repositories. Follow repository-name visibility rules when naming them, "
+            "and do not claim to have accessed them.</github_access_notice>\n"
+        ),
+    )
+
 
 __all__ = [
     "PreparationBusy",
@@ -313,12 +335,26 @@ async def _destination_may_carry(
 
 
 async def _persist_refresh(
-    sessionmaker: async_sessionmaker[AsyncSession], *, id: uuid.UUID, snapshot: SessionSnapshot
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    id: uuid.UUID,
+    snapshot: SessionSnapshot,
+    identity_changed: bool = False,
 ) -> None:
     async with sessionmaker() as session, session.begin():
-        await update_mutable_fingerprint(
-            session, id=id, snapshot=snapshot, mutable_fingerprint=fingerprint_mutable(snapshot)
-        )
+        if identity_changed:
+            # A partial App rotation changes the tokenised set of this very session.
+            await record_snapshot(
+                session,
+                id=id,
+                snapshot=snapshot,
+                identity_fingerprint=fingerprint_identity(snapshot),
+                mutable_fingerprint=fingerprint_mutable(snapshot),
+            )
+        else:
+            await update_mutable_fingerprint(
+                session, id=id, snapshot=snapshot, mutable_fingerprint=fingerprint_mutable(snapshot)
+            )
 
 
 async def _heal_lineage(deps: TurnDeps, session: AsyncSession, *, row: ThreadSessionRow) -> None:
@@ -703,11 +739,37 @@ async def _prepare_session_for_turn_locked(
             continuity=continuity,
         )
 
-    def from_fresh(fresh: FreshSession, continuity: ContinuityOutcome) -> PreparedTurn:
+    async def from_fresh(
+        fresh: FreshSession,
+        continuity: ContinuityOutcome,
+        predecessor: SessionSnapshot | None = None,
+    ) -> PreparedTurn:
+        refused = tuple(url for url, _ in fresh.snapshot.unavailable_repos)
+        prior_sent = () if predecessor is None else predecessor.unavailable_notice_sent
+        prior_pending = () if predecessor is None else predecessor.unavailable_notice_pending
+        pending = tuple(
+            dict.fromkeys((*prior_pending, *(url for url in refused if url not in prior_sent)))
+        )
+        continuity = _with_unavailable_notice(continuity, pending)
+        snapshot = fresh.snapshot.model_copy(
+            update={
+                "unavailable_notice_pending": (),
+                "unavailable_notice_sent": tuple(
+                    dict.fromkeys(
+                        (
+                            *(url for url in prior_sent if url in refused),
+                            *(url for url in pending if url in refused),
+                        )
+                    )
+                ),
+            }
+        )
+        if pending or prior_sent:
+            await _persist_refresh(deps.sessionmaker, id=fresh.mapping_id, snapshot=snapshot)
         return prepared(
             ma_session_id=fresh.ma_session_id,
             mapping_id=fresh.mapping_id,
-            model_id=fresh.snapshot.model_id,
+            model_id=fresh.snapshot.pricing_id,
             watermark=None,
             reused=False,
             continuity=continuity,
@@ -759,8 +821,9 @@ async def _prepare_session_for_turn_locked(
                 thread_id=thread_id,
                 session_account_id=session_account_id,
             )
-            return from_fresh(fresh, CONTINUED)
+            return await from_fresh(fresh, CONTINUED)
 
+        fresh_start = row.fresh_start_requested_at is not None
         if admission.is_external and not row.is_external:
             await mark_session_external(db, id=row.id)
             row = row.model_copy(update={"is_external": True})
@@ -802,6 +865,7 @@ async def _prepare_session_for_turn_locked(
                     )
             if (
                 recorded is None
+                and not fresh_start
                 and not admission.memory_read_only
                 and row.budget_channel_id in ("", admission.budget_channel_id)
             ):
@@ -811,7 +875,7 @@ async def _prepare_session_for_turn_locked(
                 return prepared(
                     ma_session_id=row.ma_session_id,
                     mapping_id=row.id,
-                    model_id=admission.agent.model.id,
+                    model_id=model_choice_id(admission.agent.model),
                     watermark=row.watermark_message_id,
                     reused=True,
                     continuity=CONTINUED,
@@ -852,8 +916,9 @@ async def _prepare_session_for_turn_locked(
             confirmed_tools=backend_switch_tools_for_turn(deps),
             channel_skills=admission.channel_skills,
         )
-        fresh_start = row.fresh_start_requested_at is not None
-        if handed_over:
+        if fresh_start:
+            decision = ReplaceSession(reasons=())
+        elif handed_over:
             decision = ReplaceSession(reasons=("agent_identity",))
         elif row.budget_channel_id not in ("", admission.budget_channel_id):
             # The sweep attributes missed events from the immutable MA session
@@ -863,8 +928,6 @@ async def _prepare_session_for_turn_locked(
             # A restricted turn must get a new read-only session when the
             # previous mount cannot be established, never reuse unknown access.
             decision = ReplaceSession(reasons=("memory_access",))
-        elif fresh_start:
-            decision = ReplaceSession(reasons=())
         else:
             assert recorded is not None, "a readable row always has a recorded snapshot here"
             rotate_app_token = (
@@ -880,7 +943,35 @@ async def _prepare_session_for_turn_locked(
                 force_app_token_rotation=rotate_app_token,
             )
 
-        def on_current(continuity: ContinuityOutcome, model_id: str) -> PreparedTurn:
+        async def on_current(
+            continuity: ContinuityOutcome,
+            model_id: str,
+            snapshot: SessionSnapshot | None = recorded,
+        ) -> PreparedTurn:
+            pending = () if snapshot is None else snapshot.unavailable_notice_pending
+            if snapshot is not None and pending:
+                continuity = _with_unavailable_notice(continuity, pending)
+                await _persist_refresh(
+                    deps.sessionmaker,
+                    id=row.id,
+                    snapshot=snapshot.model_copy(
+                        update={
+                            "unavailable_notice_pending": (),
+                            "unavailable_notice_sent": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *snapshot.unavailable_notice_sent,
+                                        *(
+                                            url
+                                            for url in pending
+                                            if url in dict(snapshot.unavailable_repos)
+                                        ),
+                                    )
+                                )
+                            ),
+                        }
+                    ),
+                )
             return prepared(
                 ma_session_id=row.ma_session_id,
                 mapping_id=row.id,
@@ -890,7 +981,9 @@ async def _prepare_session_for_turn_locked(
                 continuity=continuity,
             )
 
-        current_model = admission.agent.model.id if recorded is None else recorded.model_id
+        current_model = (
+            model_choice_id(admission.agent.model) if recorded is None else recorded.pricing_id
+        )
 
         tightening_memory = admission.memory_read_only and (
             recorded is None or not recorded.memory_read_only
@@ -917,12 +1010,22 @@ async def _prepare_session_for_turn_locked(
                 retry_after=moment + dt.timedelta(seconds=BUSY_RETRY_S),
             )
 
+        if fresh_start and turn_is_active(row, now=moment):
+            # A retired key may still be mounted in the old session. Never
+            # hand that session back while its replacement waits for a turn.
+            return PreparationBusy(
+                pending_reasons=(),
+                retry_after=moment + dt.timedelta(seconds=BUSY_RETRY_S),
+            )
+
         if not isinstance(decision, ReuseAsIs) and turn_is_active(row, now=moment):
             # Uniformly deferred: MA itself refuses `sessions.update` mid-turn,
             # and swapping a running session's `.env` or checkpointing it is a
             # race we have no reason to run.
             return PreparationDeferred(
-                prepared=on_current(ContinuityOutcome(pending=decision.reasons), current_model),
+                prepared=await on_current(
+                    ContinuityOutcome(pending=decision.reasons), current_model
+                ),
                 pending_reasons=decision.reasons,
             )
 
@@ -981,7 +1084,7 @@ async def _prepare_session_for_turn_locked(
             )
             if isinstance(outcome, PreparationFailure):
                 return outcome
-            return from_fresh(outcome.fresh, outcome.continuity)
+            return await from_fresh(outcome.fresh, outcome.continuity, recorded)
 
         assert recorded is not None, "an in-place path always has a recorded snapshot"
         applying: tuple[UpdateOp, ...] = decision.ops if isinstance(decision, UpdateInPlace) else ()
@@ -1006,6 +1109,7 @@ async def _prepare_session_for_turn_locked(
                 tenant_id=tenant_id,
                 agent_uuid=agent_uuid,
                 account_id=admission.shared_owner or admission.account_id,
+                shared_owner=admission.shared_owner,
                 mcp=deps.mcp,
                 tool_safety=deps.tool_safety,
                 fernet=deps.fernet,
@@ -1057,7 +1161,7 @@ async def _prepare_session_for_turn_locked(
                     pending_reasons=("session_changed",),
                     retry_after=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=1),
                 )
-            return on_current(CONTINUED, recorded.model_id)
+            return await on_current(CONTINUED, recorded.pricing_id)
 
         try:
             result = await run_ops()
@@ -1082,12 +1186,20 @@ async def _prepare_session_for_turn_locked(
             reason for reason in decision.reasons if reason not in result.applied
         )
         if applied:
-            await _persist_refresh(deps.sessionmaker, id=row.id, snapshot=result.snapshot)
+            await _persist_refresh(
+                deps.sessionmaker,
+                id=row.id,
+                snapshot=result.snapshot,
+                identity_changed=(
+                    result.snapshot.repo_urls != recorded.repo_urls
+                    or result.snapshot.token_repo_urls != recorded.token_repo_urls
+                ),
+            )
         outcome_state: Literal["continued", "updated"] = "updated" if applied else "continued"
         continuity = ContinuityOutcome(state=outcome_state, applied=applied, pending=pending)
         if isinstance(result, SessionBusy):
             return PreparationDeferred(
-                prepared=on_current(continuity, result.snapshot.model_id),
+                prepared=await on_current(continuity, result.snapshot.pricing_id, result.snapshot),
                 pending_reasons=pending,
             )
         log.info(
@@ -1095,4 +1207,4 @@ async def _prepare_session_for_turn_locked(
             session_id=row.ma_session_id,
             applied=list(applied),
         )
-        return on_current(continuity, result.snapshot.model_id)
+        return await on_current(continuity, result.snapshot.pricing_id, result.snapshot)

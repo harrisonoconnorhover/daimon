@@ -11,6 +11,7 @@ from daimon.core._models import Account, GitHubAppSessionVault, GitHubIssuedToke
 from daimon.core.github_credentials import decrypt_token, encrypt_token
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.stores.domain import ThreadSessionRow
+from daimon.core.stores.github_installation_coverage import installation_covers_repo_sql
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -200,6 +201,7 @@ async def select_stale_tokens(
     """
     current = now or datetime.now(UTC)
     token_filter = "AND token.token_id = :token_id" if token_id is not None else ""
+    coverage_sql = installation_covers_repo_sql("auth_row.repo_full_name", "installation")
     statement = (
         select(GitHubIssuedToken)
         .from_statement(
@@ -220,6 +222,7 @@ async def select_stale_tokens(
               AND (
                 installation.installation_id IS NULL
                 OR installation.suspended_at IS NOT NULL
+                OR installation.github_removed_at IS NOT NULL
                 OR EXISTS (
                   SELECT 1
                   FROM unnest(token.repo_ids) AS repo(repo_id)
@@ -227,6 +230,7 @@ async def select_stale_tokens(
                     ON grant_row.tenant_id = token.tenant_id
                    AND grant_row.agent_id = token.agent_id
                    AND grant_row.repo_id = repo.repo_id
+                   AND grant_row.app_visible
                   -- The row the agent may use: its own, else the server-wide one.
                   LEFT JOIN LATERAL (
                     SELECT candidate.*
@@ -241,11 +245,10 @@ async def select_stale_tokens(
                     LIMIT 1
                   ) AS auth_row ON true
                   WHERE grant_row.repo_id IS NULL
-                     OR grant_row.staged
                      OR auth_row.repo_id IS NULL
                      OR auth_row.status <> 'active'
                      OR auth_row.installation_id <> token.installation_id
-                     OR NOT (auth_row.repo_full_name = ANY(installation.repo_full_names))
+                     OR NOT ({coverage_sql})
                      OR (
                        token.superseded_at IS NULL
                        AND :include_live_version_bumps
@@ -537,26 +540,6 @@ async def mark_headless_app_session_closed(session: AsyncSession, *, session_id:
         await session.flush()
 
 
-async def select_deactivated_tokens(
-    session: AsyncSession, *, token_id: uuid.UUID | None = None
-) -> list[IssuedToken]:
-    token_filter = "AND token.token_id = :token_id" if token_id is not None else ""
-    rows = await session.scalars(
-        select(GitHubIssuedToken).from_statement(
-            text(
-                f"""SELECT token.* FROM github_issued_tokens AS token
-                LEFT JOIN agent_github_mode AS mode
-                  ON mode.tenant_id = token.tenant_id AND mode.agent_id = token.agent_id
-                WHERE token.status IN ('stored', 'delivered')
-                  AND mode.mode IS DISTINCT FROM 'app'
-                  {token_filter}"""
-            )
-        ),
-        {"token_id": token_id},
-    )
-    return [IssuedToken.model_validate(row) for row in rows]
-
-
 async def recheck_token_revoke_due(
     session: AsyncSession, *, token_id: uuid.UUID, now: datetime
 ) -> tuple[IssuedToken, bool] | None:
@@ -569,22 +552,16 @@ async def recheck_token_revoke_due(
     if row is None or row.status not in ("stored", "delivered"):
         return None
     hard_stale = bool(await select_stale_tokens(session, now=now, token_id=token_id))
-    deactivated = bool(await select_deactivated_tokens(session, token_id=token_id))
     due = row.status == "delivered" and row.revoke_after is not None and row.revoke_after <= now
     abandoned = (
         row.status == "stored"
         and row.session_id.startswith("pending:")
         and row.expires_at <= now - timedelta(minutes=6)
     )
-    if not (hard_stale or deactivated or due or abandoned):
+    if not (hard_stale or due or abandoned):
         return None
-    naturally_expired = (
-        not hard_stale
-        and not deactivated
-        and (
-            abandoned
-            or (due and row.revoke_after is not None and row.revoke_after >= row.expires_at)
-        )
+    naturally_expired = not hard_stale and (
+        abandoned or (due and row.revoke_after is not None and row.revoke_after >= row.expires_at)
     )
     return IssuedToken.model_validate(row), naturally_expired
 

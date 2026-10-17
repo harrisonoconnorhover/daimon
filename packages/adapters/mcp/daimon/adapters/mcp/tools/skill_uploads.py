@@ -24,6 +24,7 @@ attach.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -49,6 +50,9 @@ from daimon.adapters.mcp.tools._session_gate import session_card_gap
 from daimon.adapters.mcp.tools.agents import (
     _system_agent_rejection,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.github_connect import (
+    _github_connect_impl,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.adapters.mcp.tools.setup_target import (
     get_chat_origin,
     origin_channel_id,
@@ -63,6 +67,7 @@ from daimon.adapters.mcp.tools.slack._leak_policy import get_destination, is_dm_
 from daimon.core.agent_pins import agent_pin_names
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.errors import DaimonError
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.operation_policy import OperationKind, decide_operation
 from daimon.core.skill_zip import MAX_UNCOMPRESSED_BYTES
 from daimon.core.skills.add import (
@@ -253,10 +258,7 @@ async def require_skill_change(
     """Raise unless the caller may add or remove one of `agent`'s skills.
 
     A built-in agent is refused; a server admin may change any other; a
-    channel admin one of theirs that answers and runs only in their channels
-    (`daimon.core.authz.channel_admin_holds`); anyone one
-    nobody else uses, read as widely as a key change
-    (`daimon.core.agent_reach.WIDE_SHARING_OPERATIONS`).
+    a server or workspace admin.
     """
     rejection = _system_agent_rejection(agent)
     if rejection is not None:
@@ -271,21 +273,9 @@ async def require_skill_change(
     )
     if decide_operation(operation, is_admin=auth.is_admin, target=facts) == "allow":
         return
-    if facts.runs_unattended_beyond_caller:
-        why = "runs unattended (a routine or queued wake) for someone with wider rights"
-    elif facts.has_unplaced_run:
-        why = reachability.UNPLACED_RUN_REASON
-    elif facts.is_local_to_caller_channels:
-        why = reachability.NOT_HELD_REASON
-    else:
-        why = (
-            "is used beyond this caller (a default, a bound thread, or someone else's "
-            "routine or conversation)"
-        )
     raise ToolError(
-        f"'{agent_name}' {why}, so changing its skills needs a workspace or server admin, "
-        "or an admin of every channel it answers in. Tell the caller an admin can ask "
-        "Daimon to make this change. Nothing was changed. Do not retry."
+        f"Changing '{agent_name}'s skills needs a workspace or server admin. "
+        "Nothing was changed. Do not retry."
     )
 
 
@@ -300,6 +290,9 @@ async def _load_bundle(
     branch: str,
     path: str,
     origin_context_id: str | None,
+    agent_id: uuid.UUID | None,
+    agent_name: str,
+    expected_ma_agent_id: str | None,
 ) -> tuple[SkillBundle, str]:
     """The checked skill and a short origin for the ledger."""
     if skill_md is not None:
@@ -312,9 +305,7 @@ async def _load_bundle(
         return bundle, f"attachment {filename}"
     if repo_url is None:
         raise ToolError("Pass exactly one of skill_md, attachment_url or repo_url.")
-    # The workspace's stored GitHub access fetches only for an admin, so a
-    # member cannot lift files out of a private repo the workspace enrolled.
-    token = await _resolve_sync_token(runtime, auth, repo_url, http) if auth.is_admin else None
+    token = await _resolve_sync_token(runtime, auth, repo_url, http, agent_id=agent_id)
     try:
         bundle = await fetch_repo_skill(
             http,
@@ -326,8 +317,26 @@ async def _load_bundle(
             max_tarball_decompressed_bytes=runtime.settings.github.max_tarball_decompressed_bytes,
         )
     except GitHubFetchError as exc:
-        hint = " A private repo needs an admin, or paste the SKILL.md." if token is None else ""
-        raise ToolError(f"{exc}{hint}") from exc
+        if exc.status_code == 404 and token is None:
+            if agent_id is not None and origin_context_id is not None:
+                await _github_connect_impl(
+                    runtime,
+                    auth,
+                    origin_context_id=origin_context_id,
+                    agent_name=agent_name,
+                    expected_ma_agent_id=expected_ma_agent_id,
+                    repo_name=repo_url.removeprefix("https://github.com/").removesuffix(".git"),
+                    required_ability="read",
+                )
+                raise ToolError(
+                    f"No active GitHub App grant for {repo_url!r}. "
+                    "The Connect GitHub button was posted."
+                ) from exc
+            raise ToolError(
+                f"No active GitHub App grant for {repo_url!r}. "
+                "Ask an admin to use Connect GitHub for this agent and repo."
+            ) from exc
+        raise ToolError(str(exc)) from exc
     return bundle, repo_origin(repo_url, path=path, branch=branch)
 
 
@@ -479,6 +488,7 @@ async def _add_skill_impl(
 
         await recheck(agent)
         target_id = agent.id
+        github_agent_id = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
 
         async def add(bundle: SkillBundle, source: str) -> SkillAddResult:
             return await add_agent_skill(
@@ -515,6 +525,7 @@ async def _add_skill_impl(
 
         await neutral_recheck(view.revision.agent)
         target_id = view.id
+        github_agent_id = None
         catalog_id = view.revision.catalog_id
 
         async def add(bundle: SkillBundle, source: str) -> SkillAddResult:
@@ -547,6 +558,9 @@ async def _add_skill_impl(
                 branch=branch,
                 path=path,
                 origin_context_id=origin_context_id,
+                agent_id=github_agent_id,
+                agent_name=agent_name,
+                expected_ma_agent_id=target_id if hosted is None else None,
             )
         bound = confirmation_hash(bundle.preview, agent_id=target_id)
         preview = bundle.preview.model_copy(update={"content_hash": bound})
@@ -684,10 +698,9 @@ def register_skill_upload_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         neither can happen, the preview's summary says why and points to Add skill in
         /agent-setup. The
         skill belongs to this agent alone; ``sync_skills`` fills the shared library
-        instead, and ``remove_skill`` detaches it. A built-in agent is refused. Anyone
-        may change an agent nobody else uses (no default, bound thread, or other
-        people's routine or conversation); otherwise it takes a server admin or an
-        admin of every channel using it. Pass this turn's ``origin_context_id`` so its
+        instead, and ``remove_skill`` detaches it. A built-in agent is refused.
+        Changing skills takes a server or workspace admin. Pass this turn's
+        ``origin_context_id`` so its
         channel counts."""
         return await _add_skill_impl(
             runtime,

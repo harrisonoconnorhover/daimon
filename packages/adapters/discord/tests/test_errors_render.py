@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import anthropic
@@ -17,7 +16,6 @@ from daimon.adapters.discord.errors import (
     generate_request_id,
     render_error,
 )
-from daimon.core.channel_admins import InvalidChannelAdminIds
 from daimon.core.channel_budget import ChannelBudgetError
 from daimon.core.continuity.handoff import HandoffRefusedInSetupThread
 from daimon.core.cron import InvalidScheduleError
@@ -29,12 +27,10 @@ from daimon.core.errors import (
     TurnError,
     UserFacingError,
 )
-from daimon.core.github_repo_auth import resolve_clone_token
 from daimon.core.notebooks.publish import NotebookRateLimitError
 from daimon.core.setup_conversations import get_setup_responder
 from daimon.core.stores.access_policy import AccessPolicyUnreadable
 from daimon.core.stores.direct_messages import DirectMessageBusy
-from daimon.core.stores.domain import AgentRepoBindingRow
 from daimon.testing.ma import build_fake_anthropic
 from sqlalchemy.exc import DBAPIError
 from structlog.testing import capture_logs
@@ -61,24 +57,6 @@ def _status_error(
     )
 
 
-def test_known_local_errors_never_publish_exception_bodies() -> None:
-    body = "sesn_private agent_private access_token=private SELECT secret"
-    for error, expected in [
-        (ChannelBudgetError(body), "That spending budget isn't valid."),
-        (InvalidScheduleError(body), "That schedule isn't valid."),
-        (InvalidChannelAdminIds(body), "That admin selection isn't valid."),
-        (NotebookRateLimitError(body), "The notebook publishing limit has been reached."),
-        (DirectMessageBusy(body), "A reply is still running."),
-        (HandoffRefusedInSetupThread(body), "This setup conversation can't change agents."),
-        (AgentNameCollision(body), "This workspace already has an agent with that name."),
-    ]:
-        result = render_error(error, request_id=TEST_RID)
-        assert result.startswith(expected)
-        assert "private" not in result
-        assert "SELECT" not in result
-        assert result.endswith(f"\n\n{REF}"), "fixed guidance keeps the ref line"
-
-
 def test_everything_else_is_our_side_with_a_ref_and_no_body() -> None:
     body = "sesn_private agent_private access_token=private SELECT secret"
     for error in [
@@ -90,6 +68,23 @@ def test_everything_else_is_our_side_with_a_ref_and_no_body() -> None:
         DBAPIError("SELECT secret", {"token": "private"}, Exception(body)),
     ]:
         assert render_error(error, request_id=TEST_RID) == f"{OUR_SIDE}\n\n{REF}"
+
+
+def test_known_local_errors_never_publish_exception_bodies() -> None:
+    body = "sesn_private agent_private access_token=private SELECT secret"
+    for error, expected in [
+        (ChannelBudgetError(body), "That spending budget isn't valid."),
+        (InvalidScheduleError(body), "That schedule isn't valid."),
+        (NotebookRateLimitError(body), "The notebook publishing limit has been reached."),
+        (DirectMessageBusy(body), "A reply is still running."),
+        (HandoffRefusedInSetupThread(body), "This setup conversation can't change agents."),
+        (AgentNameCollision(body), "This workspace already has an agent with that name."),
+    ]:
+        result = render_error(error, request_id=TEST_RID)
+        assert result.startswith(expected)
+        assert "private" not in result
+        assert "SELECT" not in result
+        assert result.endswith(f"\n\n{REF}")
 
 
 @pytest.mark.parametrize(
@@ -246,37 +241,6 @@ async def test_missing_setup_responder_keeps_shared_helper_guidance(status: int)
     assert render_error(caught.value, request_id=TEST_RID) == (
         "This setup conversation's Daimon responder is missing. "
         "Ask the operator to restore it, then open a new setup conversation."
-        f"\n\n{REF}"
-    )
-
-
-async def test_a_converted_core_refusal_keeps_its_words_and_the_ref() -> None:
-    """The clone refusal is authored copy, so it reaches chat as written."""
-    now = datetime.now(UTC)
-    binding = AgentRepoBindingRow(
-        tenant_id=uuid.uuid4(),
-        agent_id=uuid.uuid4(),
-        repo_url="acme/widgets",
-        default_branch="main",
-        ma_secret_ref="",
-        created_at=now,
-        updated_at=now,
-    )
-    async with httpx.AsyncClient() as client:
-        with pytest.raises(UserFacingError) as caught:
-            await resolve_clone_token(
-                client,
-                binding=binding,
-                per_agent_pat=None,
-                fallback_pat=None,
-                app_id=None,
-                app_private_key=None,
-                now=int(now.timestamp()),
-            )
-    wrapped = TurnError(kind="upstream", cause=caught.value)
-    assert render_error(wrapped, request_id=TEST_RID) == (
-        "No credential is authorized to clone acme/widgets. Connect it again "
-        "with Connect GitHub."
         f"\n\n{REF}"
     )
 

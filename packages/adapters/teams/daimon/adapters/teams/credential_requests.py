@@ -21,6 +21,7 @@ from typing import Literal
 
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent
+from daimon.adapters.teams.admin_caller import admin_caller
 from daimon.adapters.teams.card_actions import (
     FAILED,
     SENDING_PANEL_ERRORS,
@@ -31,7 +32,6 @@ from daimon.adapters.teams.card_actions import (
     error_text,
     submitted_fields,
 )
-from daimon.adapters.teams.channel_admin_groups import channel_admin_caller
 from daimon.adapters.teams.credential_repos import attach_imported_skills, store_agent_pat
 from daimon.adapters.teams.identity import DENIED
 from daimon.adapters.teams.lifecycle import TEAMS_SEND_ERRORS, TeamsSender
@@ -120,7 +120,6 @@ from daimon.core.stores.agent_files import (
     AgentEnvEncryptionRequiredError,
     agent_env_writes_allowed,
 )
-from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.core.stores.domain import CredentialRequestRow, RepoAccessProof
 from daimon.core.stores.scoped_config_read import is_agent_shared_for_key_changes
 from daimon.core.teams_threads import conversation_of
@@ -537,7 +536,7 @@ class TeamsCredentialRequests:
                 ma_agent_id=str(agent.id),
                 default=self._runtime.deployment_default,
                 # Only the requester may submit, so they are the caller.
-                caller=await channel_admin_caller(
+                caller=await admin_caller(
                     self._runtime,
                     tenant_id=row.tenant_id,
                     user_id=row.requester_platform_user_id,
@@ -801,9 +800,7 @@ class TeamsCredentialRequests:
                     kind="pat", at=datetime.now(UTC), account_id=consumed.account_id
                 )
                 async with self._runtime.sessionmaker.begin() as session:
-                    await write_repo_submit(
-                        session, row=consumed, ma_secret_ref=ref, proof=proof, write=set_binding
-                    )
+                    await write_repo_submit(session, row=consumed, ma_secret_ref=ref, proof=proof)
                     await store.set_credential_request_outcome(
                         session, token=row.token, outcome="applied"
                     )
@@ -981,7 +978,7 @@ class TeamsCredentialRequests:
             url=row.mcp_server_url,
             platform="teams",
             # Only the requester may submit, so they are the caller.
-            caller=await channel_admin_caller(
+            caller=await admin_caller(
                 self._runtime,
                 tenant_id=row.tenant_id,
                 user_id=row.requester_platform_user_id,

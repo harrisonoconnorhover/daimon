@@ -4,8 +4,7 @@ These tools create single-use, expiring request rows and post a target-naming
 card through the caller's platform. Secret values never enter tool arguments.
 Submission checks requester identity. Adding a new key is a contribution;
 MCP connections and skill imports also mutate the shared agent spec, so they
-require server-admin rights or exclusive rule-bound channel ownership.
-Replacing an existing key also requires mutation ownership.
+require server-admin rights. Replacing an existing key also requires admin rights.
 `daimon.core.operation_policy` decides these here, *before* the mint. A refusal
 posts no card at all —
 nobody is asked for a secret they were never going to be allowed to save. A
@@ -27,9 +26,6 @@ from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._channel_policy import turn_origin_place
 from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
 from daimon.adapters.mcp.tools._pin_guard import require_pin_write_access
-from daimon.adapters.mcp.tools.agents import (
-    _reject_system_agent,  # pyright: ignore[reportPrivateUsage]
-)
 from daimon.adapters.mcp.tools.discord import (
     _post_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
 )
@@ -37,8 +33,7 @@ from daimon.adapters.mcp.tools.discord._credential_button import (
     edit_card_replaced as edit_discord_card_replaced,
 )
 from daimon.adapters.mcp.tools.reachability import (
-    UNPLACED_RUN_REASON,
-    channel_admin_caller,
+    admin_caller,
     target_facts,
 )
 from daimon.adapters.mcp.tools.setup_target import (
@@ -63,7 +58,6 @@ from daimon.core.credential_requests import (
     DEFAULT_TTL,
     ENV_FILE_TARGET,
     CredentialRequestKind,
-    build_skill_repo_target,
     mcp_permission_message,
     mint_request_token,
 )
@@ -75,7 +69,6 @@ from daimon.core.env_file import (
     env_name_problem,
     env_shadow_phrase,
 )
-from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.mcp_attach import decide_mcp_connect
 from daimon.core.mcp_oauth.urls import McpUrlError, assert_public_host
@@ -94,7 +87,6 @@ from daimon.core.stores.credential_requests import (
     update_credential_request_message,
 )
 from daimon.core.stores.domain import CredentialRequestRow, TurnOriginRow
-from daimon.core.stores.github_access import get_agent_mode
 from daimon.core.stores.turn_origins import get_active_origin
 from daimon.core.turn_keys import list_turn_key_names
 from fastmcp import Context, FastMCP
@@ -126,14 +118,6 @@ def _caller_is_admin(auth: AuthIdentity) -> bool:
     """
     return auth.is_admin and auth.agent_id is None
 
-
-# `normalize_owner_repo` does not truncate to two path segments (it only
-# strips a known prefix/suffix), so a URL like
-# "https://github.com/owner/repo/extra" normalizes to "owner/repo/extra"
-# rather than raising. This pattern is what actually enforces "exactly two
-# segments" before the row is minted, guaranteeing the modal's later
-# normalization sees the same shape this tool validated.
-_OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 _PENDING_TASK_DESCRIPTION = (
     "The work that should run once the value is saved, in the person's words "
@@ -315,8 +299,10 @@ async def _require_key_replacement_allowed(
     `adding` is set when `key` is not being overwritten but shadowed: a
     different name (`adding`) the same tool reads as `key`.
     """
-    outcome, facts = await _decide_attachment_write(runtime, auth, "key_replace", ma_agent=ma_agent)
-    shared = UNPLACED_RUN_REASON if facts.has_unplaced_run else "is shared with everyone here"
+    outcome, _facts = await _decide_attachment_write(
+        runtime, auth, "key_replace", ma_agent=ma_agent
+    )
+    shared = "is shared with everyone here"
     if outcome in ("managed_agent", "needs_admin") and adding is not None:
         raise ToolError(
             f"'{ma_agent.name}' {shared}, and adding '{adding}' "
@@ -362,7 +348,7 @@ async def _require_mcp_replacement_allowed(
         server_name=server_name,
         url=url,
         platform=auth.platform or "",
-        caller=channel_admin_caller(auth),
+        caller=admin_caller(auth),
         default=runtime.deployment_default,
         shares_token=shares_token,
     )
@@ -793,123 +779,6 @@ async def _request_mcp_oauth_impl(
     )
 
 
-async def _request_skill_repo_token_impl(
-    runtime: McpRuntime,
-    auth: AuthIdentity,
-    *,
-    agent_name: str,
-    repo_url: str,
-    branch: str,
-    path: str,
-    purpose: str,
-    channel_id: str,
-    pending_task: str | None = None,
-    origin_context_id: str | None = None,
-    expected_ma_agent_id: str | None = None,
-) -> RequestCredentialResult:
-    requester = _require_requestable_platform(auth)
-    if urlparse(repo_url).scheme not in ("http", "https"):
-        raise ToolError("repo url must be http or https, e.g. https://github.com/owner/repo")
-    if not _OWNER_REPO_RE.fullmatch(normalize_owner_repo(repo_url)):
-        raise ToolError(
-            "repo url must name exactly one owner/repo, e.g. https://github.com/owner/repo"
-        )
-    # "@" and "#" are the packing delimiters; a branch or path carrying one
-    # would round-trip as a different repo, so refuse rather than mangle.
-    if "@" in branch or "#" in branch:
-        raise ToolError("branch must not contain '@' or '#'")
-    if "#" in path:
-        raise ToolError("path must not contain '#'")
-    origin = await require_turn_origin(runtime, auth, origin_context_id)
-    agent_id, ma_agent = await _resolve_agent_uuid(
-        runtime, auth, agent_name, expected_ma_agent_id, origin
-    )
-    _reject_system_agent(ma_agent)
-    outcome, _ = await _decide_attachment_write(
-        runtime, auth, "skill_repo_connect", ma_agent=ma_agent
-    )
-    if outcome in ("managed_agent", "needs_admin"):
-        raise ToolError(
-            f"'{ma_agent.name}' is shared with everyone here, so importing skills onto it "
-            "needs a server or workspace admin, and the caller is not one. Nothing changed "
-            "and no card was posted. Tell them an admin can ask Daimon to import these "
-            f"skills, or fork '{ma_agent.name}' and import them onto the fork. Do not ask "
-            "anyone for a token here and do not retry."
-        )
-    return await _mint_and_post(
-        runtime,
-        auth,
-        kind="skill_repo",
-        target=build_skill_repo_target(repo_url, branch, path),
-        mcp_server_url=None,
-        agent_id=agent_id,
-        ma_agent=ma_agent,
-        requester_platform_user_id=requester,
-        agent_name=agent_name,
-        purpose=purpose,
-        channel_id=channel_id,
-        origin=origin,
-        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, repo_url)),
-        branch=branch,
-    )
-
-
-async def _request_repo_binding_impl(
-    runtime: McpRuntime,
-    auth: AuthIdentity,
-    *,
-    agent_name: str,
-    repo_url: str,
-    purpose: str,
-    channel_id: str,
-    branch: str = "main",
-    pending_task: str | None = None,
-    origin_context_id: str | None = None,
-    expected_ma_agent_id: str | None = None,
-) -> RequestCredentialResult:
-    requester = _require_requestable_platform(auth)
-    if urlparse(repo_url).scheme not in ("http", "https"):
-        raise ToolError("repo url must be http or https, e.g. https://github.com/owner/repo")
-    if not _OWNER_REPO_RE.fullmatch(normalize_owner_repo(repo_url)):
-        raise ToolError(
-            "repo url must name exactly one owner/repo, e.g. https://github.com/owner/repo"
-        )
-    # Same delimiter rule `request_skill_repo_token` applies: the branch rides
-    # in the packed `target`, so a branch carrying one would round-trip as a
-    # different repo.
-    if "@" in branch or "#" in branch:
-        raise ToolError("branch must not contain '@' or '#'")
-    origin = await require_turn_origin(runtime, auth, origin_context_id)
-    agent_id, ma_agent = await _resolve_agent_uuid(
-        runtime, auth, agent_name, expected_ma_agent_id, origin
-    )
-    # The token form is for agents still on a saved token; an App-mode agent's
-    # repos change through Connect GitHub, which never moves the working repo.
-    async with runtime.session_factory() as session:
-        mode = await get_agent_mode(session, tenant_id=origin.tenant_id, agent_id=agent_id)
-    if mode == "app":
-        raise ToolError(
-            f"{agent_name} uses the GitHub App. Call github_connect to post the "
-            "Connect GitHub button instead."
-        )
-    return await _mint_and_post(
-        runtime,
-        auth,
-        kind="repo",
-        target=build_skill_repo_target(repo_url, branch, ""),
-        mcp_server_url=None,
-        agent_id=agent_id,
-        ma_agent=ma_agent,
-        requester_platform_user_id=requester,
-        agent_name=agent_name,
-        purpose=purpose,
-        channel_id=channel_id,
-        origin=origin,
-        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, repo_url)),
-        branch=branch,
-    )
-
-
 def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     @mcp.tool(tags={"discord", "slack", "teams"})  # pyright: ignore[reportArgumentType]
     async def request_agent_key(  # pyright: ignore[reportUnusedFunction]
@@ -991,9 +860,8 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         Match supported authentication; an API key is not automatically an MCP token.
 
         Use ``attach_mcp_server`` for public servers without tokens. Never accept
-        credentials in chat. Connecting requires a workspace or server admin, or an
-        admin of every channel the agent's rule names, with all of its uses staying
-        inside those channels. This applies to new servers and replacements.
+        credentials in chat. Connecting requires a workspace or server admin.
+        This applies to new servers and replacements.
 
         Posts a requester-only card naming the agent and the server, opening a private
         form, expiring in 30 minutes. Submission attaches the server to the agent, not
@@ -1056,101 +924,6 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             server_name=server_name,
             url=url,
             channel_id=channel_id,
-            pending_task=pending_task,
-            origin_context_id=origin_context_id,
-            expected_ma_agent_id=expected_ma_agent_id,
-        )
-
-    @mcp.tool(tags={"discord", "slack", "teams"})  # pyright: ignore[reportArgumentType]
-    async def request_skill_repo_token(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context,
-        agent_name: str,
-        repo_url: Annotated[
-            str,
-            Field(description="GitHub repo or repository URL, e.g. https://github.com/owner/repo."),
-        ],
-        purpose: str,
-        channel_id: Annotated[
-            str,
-            Field(description="Compatibility field; origin controls the posting destination."),
-        ],
-        origin_context_id: str,
-        expected_ma_agent_id: str,
-        branch: Annotated[
-            str, Field(description="Branch the skills are read from, e.g. main.")
-        ] = "main",
-        path: str = "",
-        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
-    ) -> RequestCredentialResult:
-        """The skills repo is private: collect a GitHub token to import its skills.
-
-        After ``sync_skills`` cannot read a private skill repository, use this form.
-        The skill repo is separate from the working repo; for that one use
-        ``set_working_repo`` and ``github_connect``.
-
-        Posts a requester-only card naming the agent and the repo, expiring in 30
-        minutes. Its private form retries import and attachment; tokens never appear
-        in chat. Anyone talking to the agent can use the imported skills. Pass the
-        same repo URL, branch and path, and the waiting task as `pending_task` so it
-        resumes after the value is saved."""
-        return await _request_skill_repo_token_impl(
-            runtime,
-            await _auth(ctx),
-            agent_name=agent_name,
-            repo_url=repo_url,
-            branch=branch,
-            path=path,
-            purpose=purpose,
-            channel_id=channel_id,
-            pending_task=pending_task,
-            origin_context_id=origin_context_id,
-            expected_ma_agent_id=expected_ma_agent_id,
-        )
-
-    @mcp.tool(tags={"discord", "slack", "teams"})  # pyright: ignore[reportArgumentType]
-    async def request_repo_binding(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context,
-        agent_name: str,
-        repo_url: Annotated[
-            str,
-            Field(description="GitHub repo or repository URL, e.g. https://github.com/owner/repo."),
-        ],
-        purpose: str,
-        channel_id: Annotated[
-            str,
-            Field(description="Compatibility field; origin controls the posting destination."),
-        ],
-        origin_context_id: str,
-        expected_ma_agent_id: str,
-        branch: Annotated[
-            str, Field(description="Branch the agent checks out, e.g. main.")
-        ] = "main",
-        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
-    ) -> RequestCredentialResult:
-        """Legacy: save a GitHub token for an agent that already uses one.
-
-        Never offer, suggest or mention this, or any GitHub token, to people.
-        For any GitHub access, private repo or setup, use ``github_connect``
-        (the Connect GitHub link). Call this only if the person themselves
-        brings a token for an agent already on a saved token.
-        For a private skill repo use ``request_skill_repo_token``. If the user has
-        no working token, ``post_github_app_install_link`` offers a GitHub App install;
-        installing alone does not bind the repo or verify this tenant's access.
-
-        Posts a requester-only card naming the agent and the repo, expiring in 30
-        minutes. Only the requester can open its private form, which collects a GitHub
-        token only when needed; values never appear in chat. Saving binds the working
-        repository on `branch` for future sessions. Existing working tokens remain in
-        use. Pass the waiting task as `pending_task` so it resumes after the value is
-        saved."""
-        return await _request_repo_binding_impl(
-            runtime,
-            await _auth(ctx),
-            agent_name=agent_name,
-            repo_url=repo_url,
-            purpose=purpose,
-            channel_id=channel_id,
-            branch=branch,
             pending_task=pending_task,
             origin_context_id=origin_context_id,
             expected_ma_agent_id=expected_ma_agent_id,

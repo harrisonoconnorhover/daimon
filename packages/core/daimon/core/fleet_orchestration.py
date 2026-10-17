@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, Protocol
 
+import structlog
 from daimon.core.access_policy import TenantAccessPolicy
 from daimon.core.security_audit import record_authz_denial
 from mux.contracts.config import BackendConfig
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 
 type Control = Literal["kill", "resume"]
+
+log = structlog.get_logger(__name__)
 
 
 def _unique_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -61,6 +64,17 @@ def _review_required(contract: Mapping[str, JsonValue] | None) -> bool:
     if type(required) is not bool:
         raise FleetRefused("review_policy_invalid")
     return required
+
+
+def _review_target(
+    workers: tuple[FleetWorker, ...], reviewer_of: uuid.UUID, reviewer_backend: str
+) -> FleetWorker:
+    target = next((worker for worker in workers if worker.id == reviewer_of), None)
+    if target is None or target.reviewer_of is not None:
+        raise FleetRefused("review_target_required")
+    if target.backend == reviewer_backend:
+        raise FleetRefused("review_backend_must_differ")
+    return target
 
 
 def _result_format(contract: Mapping[str, JsonValue] | None) -> Literal["text", "json"]:
@@ -327,15 +341,24 @@ class FleetOrchestrator:
             now=now,
             backend=backend,
             overrides=overrides,
+            # Source memory is a host-owned binding already bounded by the
+            # retained root. The resolver validates its scope, native payload,
+            # read-only policy and explicit drops before materialization.
+            resources=tuple(
+                binding
+                for binding in parent.resources
+                if captured_source is not None
+                and binding.resource is not None
+                and binding.resource.kind == "memory_store"
+                and binding.resource.id == captured_source.memory_store_id
+            ),
             limits=limits,
             captured_source=captured_source,
         )
         reviewed: Event | None = None
         if reviewer_of is not None:
             run, workers = await self.read_snapshot(parent, policy, selected_run)
-            target = next((worker for worker in workers if worker.id == reviewer_of), None)
-            if target is None or target.reviewer_of is not None:
-                raise FleetRefused("review_target_required")
+            target = _review_target(workers, reviewer_of, resolved.backend.backend)
             reviewed = await self._result(parent, policy, run, target)
             result_contract = {
                 "format": "review",
@@ -602,8 +625,8 @@ class FleetOrchestrator:
         for worker in workers:
             if worker.reviewer_of is None:
                 continue
-            target = next((row for row in workers if row.id == worker.reviewer_of), None)
-            if target is None or target.reviewer_of is not None or target.result is None:
+            target = _review_target(workers, worker.reviewer_of, worker.backend)
+            if target.result is None:
                 raise FleetRefused("review_target_required")
             contract = worker.result_contract
             if contract != {"format": "review", "reviewed_digest": target.result.digest}:
@@ -818,8 +841,14 @@ class HostFleetPorts:
             def completed(done: asyncio.Task[None]) -> None:
                 if self._tasks.get(worker.id) is done:
                     self._tasks.pop(worker.id)
-                if not done.cancelled():
-                    done.exception()
+                error = asyncio.CancelledError() if done.cancelled() else done.exception()
+                if error is not None:
+                    log.warning(
+                        "fleet.worker_task_failed",
+                        run_id=str(worker.run_id),
+                        worker_id=str(worker.id),
+                        error_class=type(error).__name__,
+                    )
 
             task.add_done_callback(completed)
 

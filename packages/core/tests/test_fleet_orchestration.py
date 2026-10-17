@@ -239,6 +239,120 @@ async def test_spawn_passes_real_resolved_grant_to_atomic_owner(provider):
     assert owner.admit.call_args.kwargs["reviewed_result"] is None
 
 
+def frozen_memory_parent():
+    from daimon.core.authz import Surface
+    from daimon.core.memory_resource import memory_mount
+    from daimon.core.neutral_resources import freeze_root_permissions
+    from daimon.core.turn.admission import AdmissionGrant
+    from mux.contracts.extensions import ExtensionConfig
+    from mux.contracts.resources import ResourceBinding
+
+    from .test_fleet_permissions import captured_worker_source
+
+    parent, captured = captured_worker_source(permissions())
+    captured = captured.model_copy(
+        update={"memory_required": True, "memory_store_id": "retained-root-memory"}
+    )
+    binding = ResourceBinding(
+        id=captured.memory_store_id,
+        kind="native",
+        resource=captured.source.ref.model_copy(
+            update={"kind": "memory_store", "id": captured.memory_store_id}
+        ),
+        native=ExtensionConfig(
+            namespace="anthropic.session_resource_create",
+            version=1,
+            value={"resource": memory_mount(captured.memory_store_id, read_only=True)},
+        ),
+    )
+    parent = replace(
+        parent,
+        resources=(binding,),
+        source_agents=(captured.source.ref,),
+        source_revisions=((captured.source.ref, captured.source.revision),),
+    )
+    admission = AdmissionGrant(
+        tenant_id=TENANT,
+        subject=parent.subject,
+        surface=Surface.CHANNEL,
+        turn_place=parent.fleet.place,
+        run_place=parent.fleet.place,
+        agent=parent.agent,
+        channel_id="channel",
+        thread_id="thread",
+        is_dm=False,
+    )
+    parent = freeze_root_permissions(parent, captured, admission=admission, policy=POLICY, now=NOW)
+    return parent, captured, binding
+
+
+@pytest.mark.parametrize("drop_memory", (False, True))
+async def test_spawn_retains_frozen_source_memory_like_worker_preparation(drop_memory):
+    from daimon.core.neutral_resources import resolve_worker_spec
+
+    parent, captured, binding = frozen_memory_parent()
+    spec = (
+        parent.spec.model_copy(update={"declared_drops": ("memory",)})
+        if drop_memory
+        else parent.spec
+    )
+    limits = parent.limits.model_copy(update={"budget_usd": Decimal("0.2")})
+    precheck = resolve_worker_spec(
+        parent,
+        spec,
+        policy=POLICY,
+        now=NOW,
+        backend=BackendConfig.model_validate(parent.backend_grants[0].model_dump()),
+        limits=limits,
+        resources=parent.resources,
+        captured_source=captured,
+    )
+    owner = ports()
+    owner.capture_source.return_value = captured
+    await spawn(FleetOrchestrator(owner), parent, agent=spec, limits=limits)
+    owner.capture_source.assert_awaited_once_with(parent)
+    resolved = owner.admit.call_args.args[1]
+    assert resolved.digest == precheck.digest
+    assert resolved.resources == (() if drop_memory else (binding,))
+    assert resolved.permissions.memory_read_only
+    assert resolved.permissions.resources == resolved.resources
+    assert captured.memory_required is True
+
+
+@pytest.mark.parametrize("defect", ("missing", "other_store", "foreign", "writable"))
+async def test_spawn_cannot_invent_or_widen_source_memory(defect):
+    from daimon.core.memory_resource import memory_mount
+
+    parent, captured, binding = frozen_memory_parent()
+    if defect == "missing":
+        parent = replace(parent, resources=())
+    elif defect == "other_store":
+        captured = captured.model_copy(update={"memory_store_id": "different-source-store"})
+    else:
+        if defect == "foreign":
+            binding = binding.model_copy(
+                update={"resource": binding.resource.model_copy(update={"account_id": "foreign"})}
+            )
+        else:
+            binding = binding.model_copy(
+                update={
+                    "native": binding.native.model_copy(
+                        update={
+                            "value": {
+                                "resource": memory_mount(captured.memory_store_id, read_only=False)
+                            }
+                        }
+                    )
+                }
+            )
+        parent = replace(parent, resources=(binding,))
+    owner = ports()
+    owner.capture_source.return_value = captured
+    with pytest.raises(WorkerSpecRefused):
+        await spawn(FleetOrchestrator(owner), parent)
+    owner.admit.assert_not_awaited()
+
+
 @pytest.mark.parametrize("unresolved", (False, True))
 @pytest.mark.parametrize(
     "operation", ("spawn", "cross_review", "status", "collect", "kill", "resume")
@@ -495,12 +609,15 @@ def reviewed_ports(verdict="approved"):
     digest = target.result.digest
     review = event(
         '{"verdict":"' + verdict + '","reviewed_digest":"' + digest + '"}', session="review-session"
-    )
+    ).model_copy(update={"native": NativeProvenance(provider="openai", api_revision="1")})
     reviewer = worker(
         review,
         id=REVIEWER,
         ordinal=1,
         role="review",
+        backend="openai",
+        profile=backend_selection("openai").profile,
+        model=backend_selection("openai").model,
         reviewer_of=WORKER,
         binding_id="review-binding",
         result_contract={"format": "review", "reviewed_digest": digest},
@@ -508,74 +625,6 @@ def reviewed_ports(verdict="approved"):
     owner = ports(target, reviewer)
     owner.read_result.side_effect = (event(), review)
     return owner, target, reviewer
-
-
-@pytest.mark.parametrize("operation", ("kill", "resume", "collect"))
-@pytest.mark.parametrize(
-    "subject,allowed",
-    (
-        (Subject(platform_user_id="person"), True),
-        (Subject(platform_user_id="unrelated-person"), False),
-        (Subject(platform_user_id="unrelated-person", is_admin=True), True),
-        (Subject(platform_user_id="unrelated-person", is_admin=True, via_agent_key=True), False),
-        (
-            Subject(
-                platform_user_id="unrelated-person",
-                administered_channel_ids=frozenset({"channel"}),
-            ),
-            False,
-        ),
-        (Subject(), False),
-    ),
-)
-async def test_shared_fleet_control_requires_the_original_principal_or_tenant_admin(
-    operation, subject, allowed
-):
-    parent = replace(permissions(), subject=subject)
-    assert parent.fleet.scope.principal_id == "person"
-    owner = reviewed_ports()[0] if operation == "collect" else ports(worker(status="pending"))
-    service = FleetOrchestrator(owner)
-
-    async def act():
-        if operation == "collect":
-            return await service.collect(parent, POLICY, run_id=RUN)
-        return await service.control(
-            parent,
-            POLICY,
-            run_id=RUN,
-            worker_id=WORKER,
-            action=operation,
-            expected_version=3,
-            operation_key="fixture-control",
-            now=NOW,
-        )
-
-    if allowed:
-        with capture_decision() as decision:
-            result = await act()
-        assert not decision.denied
-        if operation == "collect":
-            assert result["status"] == "ready"
-            owner.validate_contract.assert_called_once()
-        else:
-            assert result["accepted"] is True
-            owner.control.assert_awaited_once()
-    else:
-        with (
-            capture_decision() as decision,
-            pytest.raises(FleetRefused, match="controller_required"),
-        ):
-            await act()
-        assert (decision.operation, decision.denied, decision.reason) == (
-            "fleet_control",
-            True,
-            "authz:controller_required",
-        )
-        owner.retained_control.assert_not_awaited()
-        owner.control.assert_not_awaited()
-        owner.wait.assert_not_awaited()
-        owner.read_result.assert_not_awaited()
-        owner.validate_contract.assert_not_called()
 
 
 async def test_nonowner_cannot_install_a_collection_wake():
@@ -638,8 +687,17 @@ async def test_controller_admin_role_does_not_bypass_run_scope(operation):
 
 
 async def test_cross_review_inputs_are_the_verified_target_event_and_digest():
-    owner = ports(worker())
-    actual = event()
+    actual = event().model_copy(
+        update={"native": NativeProvenance(provider="openai", api_revision="1")}
+    )
+    owner = ports(
+        worker(
+            actual,
+            backend="openai",
+            profile=backend_selection("openai").profile,
+            model=backend_selection("openai").model,
+        )
+    )
     owner.read_result.return_value = actual
     await spawn(FleetOrchestrator(owner), reviewer_of=WORKER, result_contract={"fake": "approval"})
     assert owner.admit.call_args.kwargs["reviewed_result"] is actual
@@ -648,6 +706,32 @@ async def test_cross_review_inputs_are_the_verified_target_event_and_digest():
         "format": "review",
         "reviewed_digest": result_digest(dict(actual.payload)),
     }
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai", "gemini"))
+async def test_same_backend_review_refuses_before_admission_or_result_read(provider):
+    parent = permissions(provider)
+    owner = ports(worker(backend=provider))
+    with pytest.raises(FleetRefused, match="review_backend_must_differ"):
+        await spawn(FleetOrchestrator(owner), parent, reviewer_of=WORKER)
+    owner.admit.assert_not_awaited()
+    owner.read_result.assert_not_awaited()
+
+
+async def test_collect_rejects_retained_same_backend_review_without_reporting():
+    owner, target, reviewer = reviewed_ports()
+    same_backend = replace(
+        reviewer, backend=target.backend, profile=target.profile, model=target.model
+    )
+    owner.read_run.return_value = (run(), (target, same_backend))
+    review = event(
+        '{"verdict":"approved","reviewed_digest":"' + target.result.digest + '"}',
+        session="review-session",
+    )
+    owner.read_result.side_effect = (event(), review)
+    with pytest.raises(FleetRefused, match="review_backend_must_differ"):
+        await FleetOrchestrator(owner).collect(permissions(), POLICY, run_id=RUN)
+    owner.validate_contract.assert_not_called()
 
 
 async def test_collect_requires_the_declared_review_even_without_a_reviewer_row():
@@ -901,7 +985,9 @@ async def test_stopped_run_never_reports_ready_even_with_successful_worker_resul
 )
 async def test_freeform_or_unbound_review_cannot_override_the_barrier(verdict):
     owner, target, reviewer = reviewed_ports()
-    actual = event(verdict, session="review-session")
+    actual = event(verdict, session="review-session").model_copy(
+        update={"native": NativeProvenance(provider="openai", api_revision="1")}
+    )
     reviewer = replace(
         reviewer,
         result=ResultPointer(
@@ -937,7 +1023,7 @@ async def test_duplicate_review_fields_cannot_replace_a_refusal_with_approval():
         + target.result.digest
         + '"}',
         session="review-session",
-    )
+    ).model_copy(update={"native": NativeProvenance(provider="openai", api_revision="1")})
     reviewer = replace(
         reviewer,
         result=ResultPointer(
@@ -993,3 +1079,68 @@ async def test_explicit_pending_control_keeps_the_card_unaccepted():
     )
     assert reply["accepted"] is False
     assert reply["status"] == "waiting"
+
+
+@pytest.mark.parametrize("operation", ("kill", "resume", "collect"))
+@pytest.mark.parametrize(
+    "subject,allowed",
+    (
+        (Subject(platform_user_id="person"), True),
+        (Subject(platform_user_id="unrelated-person"), False),
+        (Subject(platform_user_id="unrelated-person", is_admin=True), True),
+        (Subject(platform_user_id="unrelated-person", is_admin=True, via_agent_key=True), False),
+        (
+            Subject(platform_user_id="unrelated-person"),
+            False,
+        ),
+        (Subject(), False),
+    ),
+)
+async def test_shared_fleet_control_requires_the_original_principal_or_tenant_admin(
+    operation, subject, allowed
+):
+    parent = replace(permissions(), subject=subject)
+    assert parent.fleet.scope.principal_id == "person"
+    owner = reviewed_ports()[0] if operation == "collect" else ports(worker(status="pending"))
+    service = FleetOrchestrator(owner)
+
+    async def act():
+        if operation == "collect":
+            return await service.collect(parent, POLICY, run_id=RUN)
+        return await service.control(
+            parent,
+            POLICY,
+            run_id=RUN,
+            worker_id=WORKER,
+            action=operation,
+            expected_version=3,
+            operation_key="fixture-control",
+            now=NOW,
+        )
+
+    if allowed:
+        with capture_decision() as decision:
+            result = await act()
+        assert not decision.denied
+        if operation == "collect":
+            assert result["status"] == "ready"
+            owner.validate_contract.assert_called_once()
+        else:
+            assert result["accepted"] is True
+            owner.control.assert_awaited_once()
+    else:
+        with (
+            capture_decision() as decision,
+            pytest.raises(FleetRefused, match="controller_required"),
+        ):
+            await act()
+        assert (decision.operation, decision.denied, decision.reason) == (
+            "fleet_control",
+            True,
+            "authz:controller_required",
+        )
+        owner.retained_control.assert_not_awaited()
+        owner.control.assert_not_awaited()
+        owner.wait.assert_not_awaited()
+        owner.read_result.assert_not_awaited()
+        owner.validate_contract.assert_not_called()

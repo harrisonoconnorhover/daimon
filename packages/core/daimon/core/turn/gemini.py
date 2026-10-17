@@ -58,6 +58,8 @@ from mux.drivers.gemini import GeminiManagedAgents
 from mux.drivers.gemini.catalog_transport import AgentCatalogTransport
 from mux.drivers.gemini.core import compile_agent, compile_environment
 from mux.drivers.gemini.flash import FLASH_PRIMARY, FlashAccounting, FlashTransport
+from mux.drivers.gemini.mcp_auth import GCSSecretResolver, MCPSecretResolver
+from mux.drivers.gemini.skill_deployment import SkillBundlePublisher
 from mux.drivers.gemini.storage import Storage
 from mux.drivers.gemini.transport import Transport
 from mux.errors import ContinuityLost, ProviderError, ScopeViolation, UnsupportedCapability
@@ -81,6 +83,7 @@ class GeminiDeployment:
     native_agent: Agent | None = None
     max_total_tokens: int | None = None
     max_output_tokens: int | None = None
+    max_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,9 @@ class GeminiUsageRuntime:
 class GeminiTransportRuntime:
     transport: Transport
     catalog_transport: AgentCatalogTransport | None = None
+    mcp_secrets: MCPSecretResolver | None = None
+    skill_bundle_publisher: SkillBundlePublisher | None = None
+    gcs_secrets: GCSSecretResolver | None = None
 
 
 def _runtime_model(runtime: TurnRuntime | None) -> str:
@@ -109,7 +115,7 @@ def _runtime_model(runtime: TurnRuntime | None) -> str:
     return (
         deployment.agent.model.id
         if deployment is not None
-        and deployment.max_total_tokens is not None
+        and (deployment.max_total_tokens is not None or deployment.max_input_tokens is not None)
         and deployment.agent.model.id in (FLASH_PRIMARY, WORKER_MODEL)
         else FLASH_PRIMARY
     )
@@ -171,16 +177,31 @@ def gemini_backend(
         or deployment.agent.model != ModelRef(provider="gemini", id=required_model)
     ):
         raise UnsupportedCapability(("gemini_pinned_deployment",), PROFILE)
+    if deployment.max_input_tokens is not None and (
+        type(deployment.max_input_tokens) is not int
+        or deployment.max_input_tokens <= 0
+        or deployment.max_output_tokens is None
+        or required_model != FLASH_PRIMARY
+    ):
+        raise UnsupportedCapability(("worker_token_envelope",), PROFILE)
     if deployment.max_output_tokens is not None:
-        if deployment.native_agent is not None or deployment.max_total_tokens is not None:
+        if (
+            deployment.native_agent is not None and deployment.max_input_tokens is None
+        ) or deployment.max_total_tokens is not None:
             raise UnsupportedCapability(("model_interaction_resources",), PROFILE)
         compile_agent(deployment.agent, max_output_tokens=deployment.max_output_tokens)
-        compile_environment(deployment.environment, model_only=True)
+        if deployment.max_input_tokens is None:
+            compile_environment(deployment.environment, model_only=True)
+        else:
+            compile_environment(deployment.environment)
     supplied = runtime.transport_factory(config, scope)
     if not isinstance(supplied, GeminiTransportRuntime):
         raise UnsupportedCapability(("gemini_private_transport",), PROFILE)
     transport = FlashTransport(
-        supplied.transport, runtime.usage_store.accounting, native_agent=deployment.native_agent
+        supplied.transport,
+        runtime.usage_store.accounting,
+        native_agent=deployment.native_agent if deployment.max_input_tokens is None else None,
+        bounded_worker=deployment.max_input_tokens is not None,
     )
     return GeminiManagedAgents(
         transport,
@@ -193,6 +214,10 @@ def gemini_backend(
         native_agent=deployment.native_agent,
         max_total_tokens=deployment.max_total_tokens,
         max_output_tokens=deployment.max_output_tokens,
+        max_input_tokens=deployment.max_input_tokens,
+        mcp_secrets=supplied.mcp_secrets,
+        gcs_secrets=supplied.gcs_secrets,
+        skill_bundle_publisher=supplied.skill_bundle_publisher,
     )
 
 

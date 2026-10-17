@@ -9,7 +9,7 @@ keep a caller on a stale session forever.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import pytest
@@ -43,7 +43,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_memory_store_resource imp
     BetaManagedAgentsMemoryStoreResource,
 )
 from daimon.core.credential_env import assemble_env_bytes
-from daimon.core.session_compat import identity_change_reasons
+from daimon.core.session_compat import identity_change_reasons, valid_unavailable_repo_urls
 from daimon.core.session_snapshot import (
     SessionSnapshot,
     desired_snapshot,
@@ -54,8 +54,10 @@ from daimon.core.session_snapshot import (
     hash_skills,
     hash_system,
     hash_tools,
+    refreshed_unavailable_state,
     session_skills,
     snapshot_from_created_session,
+    snapshot_from_retrieved_session,
 )
 from daimon.core.stores.domain import AgentFileRow
 
@@ -290,7 +292,7 @@ def test_snapshot_from_created_session_captures_every_resource_handle() -> None:
                 mount_path="/mnt/session/repo",
                 type="github_repository",
                 updated_at=_NOW,
-                url="https://github.com/pymc-labs/example",
+                url="https://github.com/example/widgets",
                 checkout=BetaManagedAgentsBranchCheckout(name="feat/thing", type="branch"),
             ),
             BetaManagedAgentsMemoryStoreResource(
@@ -323,17 +325,18 @@ def test_snapshot_from_created_session_captures_every_resource_handle() -> None:
     assert snapshot.repo_resource_id == "res_repo", (
         "the repo resource id is the token-rotation handle"
     )
-    assert snapshot.repo_url == "https://github.com/pymc-labs/example", (
-        "repo url comes off the resource"
-    )
-    assert snapshot.repo_urls == (), "legacy snapshots keep the predeploy repo-set default"
-    assert snapshot.repo_branch == "feat/thing", "a branch checkout must be read off the resource"
+    assert snapshot.repo_url is None, "App sessions record repositories as a set"
+    assert snapshot.repo_urls == ("https://github.com/example/widgets",)
+    assert snapshot.repo_branch is None, "App sessions do not pin a legacy branch"
     assert snapshot.repo_mount_path == "/mnt/session/repo", "the repo mount path must be recorded"
     assert snapshot.memory_store_id == "memstore_7", "the mounted memory store must be recorded"
     assert snapshot.vault_id == "vault_9", "an unspecified vault falls back to the session's own"
     assert snapshot.environment_id == "env_science", "the environment is frozen at create time"
     assert snapshot.agent_version == 3, "the agent version is kept for diagnostics"
     assert snapshot.agent_name == "research-bot", "the agent name is kept for diagnostics"
+    backfilled = snapshot_from_retrieved_session(session)
+    assert backfilled.github_mode == "app"
+    assert "github_mode" not in identity_change_reasons(backfilled, snapshot)
 
 
 def test_snapshot_survives_a_json_round_trip() -> None:
@@ -342,7 +345,7 @@ def test_snapshot_survives_a_json_round_trip() -> None:
         hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="env-hash",
-        repo_url="https://github.com/pymc-labs/example",
+        repo_url="https://github.com/example/widgets",
         repo_branch="main",
         memory_store_id="memstore_7",
         vault_id="vault_9",
@@ -366,7 +369,7 @@ def test_identity_fingerprint_ignores_handles_and_diagnostics() -> None:
         hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="env-hash",
-        repo_url="https://github.com/pymc-labs/example",
+        repo_url="https://github.com/example/widgets",
         repo_branch="main",
         memory_store_id="memstore_7",
         vault_id="vault_9",
@@ -743,3 +746,91 @@ def test_a_snapshot_without_a_personal_store_keeps_its_recorded_fingerprint() ->
 
     assert fingerprint_identity(legacy) == fingerprint_identity(snapshot)
     assert fingerprint_identity(with_personal) != fingerprint_identity(snapshot)
+
+
+def test_old_snapshot_unavailability_fields_are_ignored() -> None:
+    snapshot = desired_snapshot(
+        _agent(),
+        hidden_mcp_server_names=frozenset(),
+        environment_id="env_science",
+        env_sha256=None,
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id=None,
+        vault_id=None,
+    )
+    legacy = SessionSnapshot.model_validate(
+        {
+            **snapshot.model_dump(exclude={"unavailable_repos"}),
+            "unavailable_repo_urls": ("https://github.com/acme/refused",),
+            "unavailable_since": _NOW,
+            "unavailable_notice_announced": False,
+        }
+    )
+    assert legacy.unavailable_repos == ()
+    assert legacy.unavailable_notice_pending == ()
+    assert valid_unavailable_repo_urls(legacy, now=_NOW) == ()
+
+
+def test_refusal_keeps_first_time_and_announces_once_until_access_returns() -> None:
+    url = "https://github.com/acme/refused"
+    snapshot = desired_snapshot(
+        _agent(),
+        hidden_mcp_server_names=frozenset(),
+        environment_id="env_science",
+        env_sha256=None,
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id=None,
+        vault_id=None,
+    )
+    first = snapshot.model_copy(update=refreshed_unavailable_state(snapshot, (url,), now=_NOW))
+    assert first.unavailable_repos == ((url, _NOW),)
+    assert first.unavailable_notice_pending == (url,)
+    dropped_before_notice = first.model_copy(
+        update=refreshed_unavailable_state(first, (), now=_NOW + timedelta(minutes=61))
+    )
+    assert dropped_before_notice.unavailable_repos == ()
+    assert dropped_before_notice.unavailable_notice_pending == (url,)
+    announced = first.model_copy(
+        update={
+            "unavailable_notice_pending": (),
+            "unavailable_notice_sent": (url,),
+        }
+    )
+    later = _NOW + timedelta(minutes=40)
+    refused_again = announced.model_copy(
+        update=refreshed_unavailable_state(announced, (url,), now=later)
+    )
+    assert refused_again.unavailable_repos == ((url, _NOW),)
+    assert refused_again.unavailable_notice_pending == ()
+    dropped = refused_again.model_copy(
+        update=refreshed_unavailable_state(refused_again, (), now=later)
+    )
+    assert dropped.unavailable_repos == ()
+    assert dropped.unavailable_notice_sent == ()
+    anew = dropped.model_copy(update=refreshed_unavailable_state(dropped, (url,), now=later))
+    assert anew.unavailable_repos == ((url, later),)
+    assert anew.unavailable_notice_pending == (url,)
+
+
+def test_native_fast_model_is_in_session_identity_and_pricing():
+    agent = _agent(model_id="claude-opus-5-5")
+    kwargs = dict(
+        hidden_mcp_server_names=frozenset(),
+        environment_id="env",
+        env_sha256=None,
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id=None,
+        vault_id=None,
+    )
+    standard = desired_snapshot(agent, **kwargs)
+    agent = agent.model_copy(
+        update={"model": BetaManagedAgentsModelConfig(id="claude-opus-5-5", speed="fast")}
+    )
+    fast = desired_snapshot(agent, **kwargs)
+    assert fast.model_id == "claude-opus-5-5"
+    assert fast.pricing_id == "claude-opus-5-5-fast"
+    assert identity_change_reasons(standard, fast) == ("model",)
+    assert fingerprint_identity(fast) != fingerprint_identity(standard)

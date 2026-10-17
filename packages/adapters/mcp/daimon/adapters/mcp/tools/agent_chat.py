@@ -102,6 +102,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_BUDGET_CHANNEL, MA_MET
 from daimon.core.github_app_session import close_headless_app_session
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.ma_resolver import find_agent_by_derived_uuid_cached
+from daimon.core.mcp_vault import refresh_mounted_mcp_vaults
 from daimon.core.permissions import agent_permissions, channel_permissions, memory_writable
 from daimon.core.pricing import MODEL_PRICING, cost_of
 from daimon.core.scope import ScopeContext
@@ -110,7 +111,7 @@ from daimon.core.session_ports_compat import archive_session_record
 from daimon.core.session_seal import seal_ids
 from daimon.core.sessions import create_isolated_session, create_session
 from daimon.core.stores import session_settle_state
-from daimon.core.stores.agent_repo_binding import get_binding
+from daimon.core.stores.github_access import list_live_grant_repositories
 from daimon.core.stores.github_issued_tokens import touch_unmapped_app_session
 from daimon.core.stores.scoped_config_read import resolve
 from daimon.core.turn.outcomes import current_outcome
@@ -485,8 +486,10 @@ async def _describe_agent_impl(
     if auth.agent_id is None:
         raise ToolError("agent not found")
     async with runtime.session_factory() as session:
-        binding = await get_binding(session, tenant_id=auth.tenant_id, agent_id=auth.agent_id)
-    repo_url = binding.repo_url if binding is not None else None
+        grants = await list_live_grant_repositories(
+            session, tenant_id=auth.tenant_id, agent_id=auth.agent_id
+        )
+    repo_url = next((repo.repo_full_name for grant, repo in grants if grant.is_working_repo), None)
     skill_names = [sk.skill_id for sk in ma_agent.skills]
     role_summary = (ma_agent.system or "")[:200]
     return AgentDescription(
@@ -625,15 +628,11 @@ async def _start_turn_impl(
             origin_seal_ids=seal,
         )
     else:
-        github_fallback_pat: str | None = (
-            runtime.settings.github.fallback_pat.get_secret_value()
-            if runtime.settings.github.fallback_pat is not None
-            else None
-        )
-        github_app_id: str | None = runtime.settings.github.app_id
+        github_fallback_pat: str | None = None
+        github_app_id: str | None = runtime.settings.github_app.app_id
         github_app_private_key: str | None = (
-            runtime.settings.github.app_private_key.get_secret_value()
-            if runtime.settings.github.app_private_key is not None
+            runtime.settings.github_app.private_key.get_secret_value()
+            if runtime.settings.github_app.private_key is not None
             else None
         )
 
@@ -761,6 +760,21 @@ async def _continue_turn_impl(
             touched = await touch_unmapped_app_session(db, session_id=handle)
             if touched is False:
                 raise ToolError("This session is closed.")
+        mcp = runtime.settings.mcp
+        if mcp.public_url is not None and mcp.jwt_secret is not None:
+            mounted = await _verify_agent_owns_session(runtime, auth, handle)
+            assert auth.agent_id is not None  # verified above, including after fence acquisition
+            await refresh_mounted_mcp_vaults(
+                runtime.client,
+                vault_ids=mounted.vault_ids,
+                account_id=auth.account_id,
+                agent_id=auth.agent_id,
+                jwt_secret=mcp.jwt_secret.get_secret_value().encode(),
+                public_url=str(mcp.public_url),
+                now=now(),
+                session_factory=runtime.session_factory,
+                scope=mcp_scope(auth),
+            )
         # Inside the fence, so settle requests follow the order of the sends.
         turn_event_id = await _send_billed(runtime, handle, message, scope=mcp_scope(auth))
     return {

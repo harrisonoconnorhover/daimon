@@ -25,6 +25,7 @@ from anthropic.types.beta.memory_stores.beta_managed_agents_memory_list_item imp
     BetaManagedAgentsMemoryListItem,
 )
 from anthropic.types.beta.skills import VersionCreateResponse, VersionListResponse
+from daimon.core.model_presets import ModelSelection, resolve_model
 from daimon.core.mux_backend import managed_agents, resource_ref
 from mux.contracts.ids import Revision, Scope, SkillRef
 from mux.contracts.ports import SkillVersions
@@ -106,7 +107,7 @@ def _agent_values(payload: Mapping[str, object]) -> dict[str, object]:
     result = dict(payload)
     extensions: dict[str, object] = {}
     if "model" in result and result["model"] is not None:
-        model = result["model"]
+        model = resolve_model(cast("ModelSelection", result["model"]))
         result["model"] = {
             "provider": "anthropic",
             "id": model if isinstance(model, str) else _mapping(model)["id"],
@@ -241,7 +242,8 @@ def sdk_agent(record: Agent) -> BetaManagedAgentsAgent:
     from mux.drivers.anthropic.resources.agents import agent_payload
 
     payload = agent_payload(spec)
-    payload["model"] = {"id": spec.model.id, **dict(spec.model.options)}
+    if isinstance(payload["model"], str):
+        payload["model"] = {"id": payload["model"]}
     payload.update(
         {
             "id": record.ref.id,
@@ -280,7 +282,13 @@ def sdk_environment(record: Environment) -> BetaEnvironment:
         type="environment",
         **record.model_dump(mode="json", include={"created_at", "updated_at", "archived_at"}),
     )
-    return BetaEnvironment.model_validate(payload)
+    # Native responses can carry a null description despite the SDK's str annotation.
+    # Validate every other field strictly, then restore that exact response metadata.
+    null_description = record.spec.description is None
+    if null_description:
+        payload["description"] = ""
+    environment = BetaEnvironment.model_validate(payload)
+    return environment.model_copy(update={"description": None}) if null_description else environment
 
 
 async def list_agents(

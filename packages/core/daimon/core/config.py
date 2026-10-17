@@ -11,6 +11,7 @@ import binascii
 import json
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal, cast
@@ -19,6 +20,7 @@ from uuid import UUID
 from daimon.core.thread_participation import ParticipationMode
 from daimon.core.tool_safety import ToolSafetyPolicy
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -87,10 +89,22 @@ class DatabaseSettings(BaseModel):
     )
 
 
+ANTHROPIC_UNCONFIGURED_PLACEHOLDER = "sk-ant-unconfigured-openai-only-deployment"
+"""Never a valid credential. `AnthropicSettings.resolved_api_key()` returns
+this when no real key is configured, so every `AsyncAnthropic` client in the
+app can keep its existing non-optional constructor call: an OpenAI-only
+deployment that never exercises the Anthropic/default path never notices,
+and one that accidentally does gets a clean 401 instead of a crash at
+startup or a scattered `Optional` check at every call site."""
+
+
 class AnthropicSettings(BaseModel):
-    api_key: SecretStr = Field(
+    api_key: SecretStr | None = Field(
+        default=None,
         description=(
-            "Anthropic API key used to authenticate all Managed Agents SDK calls. Required."
+            "Anthropic API key used to authenticate all Managed Agents SDK calls. "
+            "Required unless this deployment is OpenAI-only (see docs/self-hosting.md's "
+            "'Self-host on OpenAI'), in which case leave it unset."
         ),
     )
     base_url: HttpUrl = Field(
@@ -109,6 +123,19 @@ class AnthropicSettings(BaseModel):
             "Other deployments in the same organization share that limit."
         ),
     )
+
+    def resolved_api_key(self) -> str:
+        """The real key, or a placeholder for an OpenAI-only deployment.
+
+        Never falls back to an ambient `ANTHROPIC_API_KEY`-style env var —
+        unset means unset, exactly like every other explicit credential in
+        this settings tree.
+        """
+        return (
+            self.api_key.get_secret_value()
+            if self.api_key is not None
+            else ANTHROPIC_UNCONFIGURED_PLACEHOLDER
+        )
 
 
 class CLISettings(BaseModel):
@@ -165,6 +192,37 @@ class McpSettings(BaseModel):
             "Secret used to sign and verify MCP bearer tokens. Required to run the MCP adapter."
         ),
     )
+    legacy_token_cutoff: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "UTC deadline for a temporary legacy-token deployment window. Dates before "
+            "2026-10-16 or over six hours in the future are refused. At/after the deadline "
+            "all unregistered tokens are rejected, regardless of issuance time. Internal "
+            "tokens are always rejected without a registry row."
+        ),
+    )
+    allow_legacy_tokens: bool = Field(
+        default=False,
+        description=(
+            "Temporary minters-first deployment compatibility only. Requires a bounded "
+            "legacy_token_cutoff; only non-internal legacy tokens qualify and stop working at that "
+            "deadline even if the deployment is interrupted. Default false requires "
+            "registered tokens immediately."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def bounded_legacy_window(self) -> McpSettings:
+        cutoff = self.legacy_token_cutoff
+        now = datetime.now(UTC)
+        if cutoff is not None and cutoff < datetime(2026, 10, 16, tzinfo=UTC):
+            raise ValueError("legacy_token_cutoff must be on or after 2026-10-16 UTC")
+        if cutoff is not None and cutoff > now + timedelta(hours=6):
+            raise ValueError("legacy_token_cutoff cannot be more than six hours ahead")
+        if self.allow_legacy_tokens and cutoff is None:
+            raise ValueError("legacy compatibility requires an explicit cutoff")
+        return self
+
     require_routine_destination: bool = Field(
         default=False,
         description=(
@@ -387,6 +445,13 @@ class ThreadParticipationSettings(BaseModel):
     )
 
 
+class EnvironmentSettings(BaseModel):
+    name: str = Field(
+        default="",
+        description="Deployment name. Empty selects production Discord command behavior.",
+    )
+
+
 class DiscordSettings(BaseModel):
     """Discord adapter config.
 
@@ -396,6 +461,13 @@ class DiscordSettings(BaseModel):
 
     bot_token: SecretStr = Field(
         description="Discord bot token. Required to run the Discord adapter.",
+    )
+    command_guild_ids: list[int] = Field(
+        default_factory=list[int],
+        description=(
+            "Guilds allowed to receive commands and events when the environment name is set. "
+            "An empty list disables all Discord ingress, including DMs, in non-production."
+        ),
     )
     startup_replay_minutes: int = Field(
         default=0,
@@ -716,20 +788,21 @@ class TeamsSettings(BaseModel):
         default=None,
         description=(
             "Externally reachable base URL of the Teams service (the Bot "
-            "Framework messaging endpoint without /api/messages). Enables the "
-            "admin sign-in that grants Daimon a team's SharePoint site; its "
-            "callback is <public_url>/oauth/teams/files/callback, which must be "
-            "a Web redirect URI on the app registration."
+            "Framework messaging endpoint without /api/messages). Graph's change "
+            "notifications for private and shared channels post to it."
         ),
     )
-    admin_user_ids: tuple[str, ...] = Field(
-        default=(),
+    admin_team_id: str | None = Field(
+        default=None,
         description=(
-            "Entra object IDs of the people who administer this deployment "
-            "from Teams. Teams exposes no admin role to bots, so this list is "
-            "the admin check: admins get the admin role in turns, create "
-            "routines, replace shared keys, top up and see everyone's usage. "
-            "Everyone else is a regular user."
+            "Entra group ID of the team whose owners administer this deployment "
+            "from Teams: admins get the admin role in turns, create routines, "
+            "replace shared keys, top up and see everyone's usage. Adding an "
+            "admin means making them an owner of that team; no redeploy. The "
+            "app must be installed in that team. To find the ID, open the "
+            "team's ⋯ menu in Teams, choose Get link to team and copy the "
+            "groupId parameter. Guests and people from another organisation "
+            "are never admins. Unset: nobody is an admin."
         ),
     )
     restrict_guests: bool = Field(
@@ -752,15 +825,17 @@ class TeamsSettings(BaseModel):
         ),
     )
 
-    @field_validator("admin_user_ids")
+    @field_validator("admin_team_id")
     @classmethod
-    def _canonicalize_admin_user_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Compare against the canonical lowercase form inbound ids arrive in."""
+    def _canonicalize_admin_team_id(cls, value: str | None) -> str | None:
+        """Compare against the canonical lowercase form Graph and activities use."""
+        if value is None or not value.strip():
+            return None
         try:
-            return tuple(str(UUID(item)) for item in value)
+            return str(UUID(value))
         except ValueError:
             raise ValueError(
-                "DAIMON_TEAMS__ADMIN_USER_IDS must list Entra object ID UUIDs"
+                "DAIMON_TEAMS__ADMIN_TEAM_ID must be the team's Entra group ID UUID"
             ) from None
 
     @field_validator("tenant_id")
@@ -816,60 +891,8 @@ def validate_github_app_slug(value: str | None) -> str | None:
 
 
 class GithubSettings(BaseModel):
-    """GitHub repository access config (App-or-PAT; no OAuth flow). All fields are
-    optional so deployments without GitHub App or PAT config keep working.
+    """Size limits for GitHub skill imports."""
 
-    Cloning via the GitHub App requires only app_id + app_private_key.
-    app_slug is needed only to construct the App's install link; a
-    deployment that never surfaces that link can leave it unset.
-    webhook_secret is optional and required only for the skill-sync
-    push-driven resync webhook.
-    """
-
-    oauth_scopes: tuple[str, ...] = Field(
-        default=(
-            "repo",
-            "read:user",
-            "read:org",
-            "workflow",
-        ),
-        description=(
-            "OAuth scopes requested when a GitHub token-broker flow is used. "
-            "Not consulted for GitHub App or PAT authentication."
-        ),
-    )
-    app_id: str | None = Field(
-        default=None,
-        description="GitHub App ID used to mint short-lived installation tokens for repo cloning.",
-    )
-    app_private_key: SecretStr | None = Field(
-        default=None,
-        description="Private key (PEM) for the GitHub App identified by app_id.",
-    )
-    app_slug: str | None = Field(
-        default=None,
-        description=(
-            "GitHub App's URL name, used to build the App's install link so "
-            "members can be pointed at it from chat and from the setup "
-            "panel. Cloning does not need it, so a deployment that never "
-            "surfaces the install link can leave it unset."
-        ),
-    )
-    webhook_secret: SecretStr | None = Field(
-        default=None,
-        description=(
-            "Secret used to verify GitHub webhook payload signatures. Required "
-            "only to enable the skill-sync push-driven resync webhook."
-        ),
-    )
-    fallback_pat: SecretStr | None = Field(
-        default=None,
-        description=(
-            "Operator-wide personal access token used as the clone credential "
-            "for public-repo bindings that have no per-agent credential. "
-            "Needs no scopes — any valid token clones a public repo."
-        ),
-    )
     max_tarball_bytes: int = Field(
         default=50 * 1024 * 1024,
         description=(
@@ -889,16 +912,6 @@ class GithubSettings(BaseModel):
             "recommended in production)."
         ),
     )
-
-    @field_validator("app_private_key", mode="before")
-    @classmethod
-    def _decode_base64_private_key(cls, value: object) -> object:
-        return decode_github_app_private_key(value)
-
-    @field_validator("app_slug")
-    @classmethod
-    def _validate_app_slug(cls, value: str | None) -> str | None:
-        return validate_github_app_slug(value)
 
 
 class GithubAppSettings(BaseModel):
@@ -1569,7 +1582,7 @@ class Settings(BaseSettings):
         default_factory=dict[uuid.UUID, bool],
         description=(
             "Per-tenant switch for the channel budget notice, keyed by tenant UUID. "
-            "When a channel's budget is used up, its channel admins (else the server admins) "
+            "When a channel's budget is used up, the server admins "
             "get one DM per budget window on Discord, Slack and Teams. Missing/true sends it; "
             "false turns it off. Configure DAIMON_BUDGET_NOTICES as a JSON object."
         ),
@@ -1593,7 +1606,7 @@ class Settings(BaseSettings):
         ),
     )
     database: DatabaseSettings
-    anthropic: AnthropicSettings
+    anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     privacy_policy_url: HttpUrl = Field(
         default=HttpUrl("https://github.com/pymc-labs/daimon/blob/main/PRIVACY.md"),
         description=(
@@ -1609,6 +1622,7 @@ class Settings(BaseSettings):
     mcp: McpSettings = Field(default_factory=McpSettings)
     hub: HubSettings = Field(default_factory=HubSettings)
     agent_identity: AgentIdentitySettings = Field(default_factory=AgentIdentitySettings)
+    environment: EnvironmentSettings = Field(default_factory=EnvironmentSettings)
     discord: DiscordSettings | None = None
     thread_participation: ThreadParticipationSettings = Field(
         default_factory=ThreadParticipationSettings,

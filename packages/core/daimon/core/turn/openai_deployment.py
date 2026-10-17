@@ -15,13 +15,14 @@ from uuid import UUID
 
 from daimon.core.channel_backend import load_backend_agent
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME
+from daimon.core.mcp_auth import resolve_agent_mcp_credential
 from daimon.core.neutral_resources import NeutralResourceHost, ResolvedWorkerSpec
 from daimon.core.pricing import provider_prices
 from daimon.core.sessions import native_session_budget_cents
 from daimon.core.stores.domain import BackendAgent
 from daimon.core.stores.neutral_catalog import AgentRevision
 from daimon.core.turn.errors import AdmissionDenied
-from daimon.core.turn.openai_codec import PROFILE
+from daimon.core.turn.openai_codec import CONVERSATION_PROFILE, PROFILE, PROFILES
 from daimon.core.turn.openai_host import OpenAIHostRuntime, driver, register_host
 from daimon.core.turn.openai_state import OpenAIRecoveryJournal, OpenAIUsageRevisions
 from daimon.core.turn.persistence import TurnPersistence
@@ -29,9 +30,11 @@ from daimon.core.turn.prepare import ProviderPreparationRequest
 from daimon.core.turn.runtime_manifest import (
     ApiKeyEnvironment,
     ConfigurationGrant,
+    SourceCapabilities,
     fixed_plan_origin_allowed,
     materialize_counterpart,
     read_counterpart,
+    represented_source,
     select_runtime_manifest,
     validate_counterpart_pins,
     validate_counterpart_request,
@@ -44,6 +47,7 @@ from mux.drivers.openai.session_controls import SessionControls
 from mux.drivers.openai.skill_bindings import reserved as skill_metadata_key
 from mux.drivers.openai.transport import Transport
 from mux.errors import ScopeViolation
+from mux.profiles import get_profile
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -64,7 +68,7 @@ class OpenAIDeployment(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    profile: Literal["openai.persistent_workspace"]
+    profile: Literal["openai.persistent_workspace", "openai.conversation_only"]
     tenant_id: Nonblank
     platform: Nonblank
     channel_id: Nonblank
@@ -73,7 +77,7 @@ class OpenAIDeployment(BaseModel):
     configuration_grant: ConfigurationGrant | None = None
     project: Nonblank
     agent_id: Nonblank | None = None
-    environment_id: Nonblank
+    environment_id: Nonblank | None = None
     api_key_env: ApiKeyEnvironment
     spend_limit_usd_cents: Annotated[int, Field(gt=0, strict=True)] | None = None
     skill_ids: tuple[Nonblank, ...] = ()
@@ -84,12 +88,36 @@ class OpenAIDeployment(BaseModel):
     source_agent_version: Annotated[int, Field(gt=0, strict=True)] | None = None
     counterpart_catalog_id: Nonblank | None = None
     counterpart_catalog_revision: Annotated[int, Field(gt=0, strict=True)] | None = None
+    source_capabilities: SourceCapabilities | None = None
+    mcp_credential_file: Path | None = Field(default=None, repr=False)
 
     @model_validator(mode="after")
     def _configuration_authorization(self) -> OpenAIDeployment:
         if self.config_digest is None and self.configuration_grant is None:
             raise ValueError("a deployment requires exact or bounded configuration authorization")
+        if self.profile == CONVERSATION_PROFILE:
+            if self.environment_id is not None or self.skill_ids:
+                raise ValueError(
+                    "conversation-only deployments cannot authorize environments or skills"
+                )
+        elif self.environment_id is None:
+            raise ValueError("persistent-workspace deployments require an environment identity")
         validate_counterpart_pins(self, worker_materialization=self.worker_materialization)
+        if self.source_capabilities is not None:
+            if (
+                self.profile != PROFILE
+                or self.worker_materialization
+                or self.source_agent_id is None
+                or self.mcp_credential_file is None
+                or not self.mcp_credential_file.is_absolute()
+                or self.source_capabilities.model.provider != get_profile(self.profile).provider
+                or self.source_capabilities.model.id != "gpt-6-luna"
+                or tuple(item.target.id for item in self.source_capabilities.skills)
+                != self.skill_ids
+            ):
+                raise ValueError("full source deployment requires exact skills and caller binding")
+        elif self.mcp_credential_file is not None:
+            raise ValueError("MCP credential requires captured source capabilities")
         if not self.worker_materialization and self.agent_id is None:
             raise ValueError("a fixed deployment requires a native agent identity")
         return self
@@ -105,6 +133,20 @@ class OpenAIDeployment(BaseModel):
 
         worker = request.worker
         expected = self.worker_environment(request, worker) if worker is not None else None
+        if self.source_capabilities is not None:
+            proof = represented_source(source, request.target_spec)
+            if (
+                worker is not None
+                or proof is None
+                or proof.source_pin != self.source_capabilities.source_pin
+                or proof.target.model != self.source_capabilities.model
+                or proof.target.skills
+                != tuple(item.target for item in self.source_capabilities.skills)
+                or proof.environment != self.source_capabilities.environment
+                or {"tools", "skills", "mcp"}.intersection(proof.target.declared_drops)
+            ):
+                raise AdmissionDenied(reason="backend_unsupported")
+            expected = proof.environment
 
         async def verify_native(checked: AgentRevision) -> None:
             if worker is not None:
@@ -140,6 +182,12 @@ class OpenAIDeployment(BaseModel):
         resources: NeutralResourceHost,
         expected: EnvironmentSpec | None,
     ) -> None:
+        if self.profile == CONVERSATION_PROFILE:
+            if expected is not None or self.environment_id is not None:
+                raise AdmissionDenied(reason="backend_unsupported")
+            return
+        if self.environment_id is None:
+            raise AdmissionDenied(reason="backend_unsupported")
         scope = request.scope
         environment = await resources.backend.environments.retrieve(
             scope,
@@ -153,10 +201,20 @@ class OpenAIDeployment(BaseModel):
             ),
         )
         if expected is not None:
+            # A represented source's labels and native visibility do not grant
+            # access to this target. The pinned project, tenant and account do.
+            # Preserve all execution policy; target templates have no source
+            # description, reconciliation metadata or native visibility field.
+            represented = self.source_capabilities is not None
             expected = expected.model_copy(
                 update={
-                    "description": None if expected.description == "" else expected.description,
-                    "metadata": None if expected.metadata == {} else expected.metadata,
+                    "description": None
+                    if represented or expected.description == ""
+                    else expected.description,
+                    "metadata": None
+                    if represented or expected.metadata == {}
+                    else expected.metadata,
+                    "scope": None if represented else expected.scope,
                 }
             )
         if (
@@ -168,10 +226,34 @@ class OpenAIDeployment(BaseModel):
 
     def worker_environment(
         self, request: ProviderPreparationRequest, worker: ResolvedWorkerSpec
-    ) -> EnvironmentSpec:
+    ) -> EnvironmentSpec | None:
         """Refuse unrepresentable plans before reading or allocating native resources."""
         revision = request.admission.backend_revision
         drops, spec, environment = worker.declared_drops, worker.spec, worker.environment
+        if self.profile == CONVERSATION_PROFILE:
+            if (
+                revision is None
+                or worker.backend.content_digest() != revision.content_digest()
+                or revision.profile != self.profile
+                or spec.model.provider != "openai"
+                or spec.model.id != revision.model
+                or worker.permissions.fleet.scope != request.scope
+                or not {"sandbox", "tools", "mcp", "memory", "skills"}.issubset(drops)
+                or worker.resources
+                or environment is not None
+                or spec.tools
+                or spec.skills
+                or spec.mcp_servers
+                or spec.extensions
+                or spec.model.options
+                or spec.description is not None
+                or any(
+                    key == "mux_tenant" or key == MCP_METADATA_KEY or skill_metadata_key(key)
+                    for key in spec.metadata or {}
+                )
+            ):
+                raise AdmissionDenied(reason="backend_unsupported")
+            return None
         if (
             revision is None
             or worker.backend.content_digest() != revision.content_digest()
@@ -212,7 +294,6 @@ class OpenAIDeployment(BaseModel):
             )
             or any(connection.credential_ref is not None for connection in spec.mcp_servers or ())
         ):
-            # Conversation-only creation needs a consumed initial-input edge.
             # Never substitute a hosted container for a no-execution declaration.
             raise AdmissionDenied(reason="backend_unsupported")
         return environment
@@ -221,7 +302,10 @@ class OpenAIDeployment(BaseModel):
 def load_deployment(request: ProviderPreparationRequest) -> OpenAIDeployment:
     origin = request.admission.backend_revision_origin
     if fixed_plan_origin_allowed(origin):
-        return _manifest_deployment(request)
+        deployment = _manifest_deployment(request)
+        if deployment.source_capabilities is not None:
+            raise AdmissionDenied(reason="backend_unsupported")
+        return deployment
     if origin != "agent" or not request.deps.agent_backends:
         raise AdmissionDenied(reason="backend_unsupported")
     deployment = _manifest_deployment(request)
@@ -233,13 +317,15 @@ def load_deployment(request: ProviderPreparationRequest) -> OpenAIDeployment:
 
 def _manifest_deployment(request: ProviderPreparationRequest) -> OpenAIDeployment:
     revision = request.admission.backend_revision
-    if revision is None or revision.profile != "openai.persistent_workspace":
+    if revision is None or revision.profile not in PROFILES:
         raise AdmissionDenied(reason="backend_unsupported")
     return select_runtime_manifest(request, OpenAIDeployment)
 
 
-def authorized_deployments(tenant_id: str) -> tuple[OpenAIDeployment, ...]:
-    """Every explicit OpenAI deployment the operator's manifest grants one tenant.
+def authorized_deployments(
+    tenant_id: str, *, profile: str = PROFILE
+) -> tuple[OpenAIDeployment, ...]:
+    """Explicit deployments for one tenant and the selected OpenAI profile.
 
     For callers outside a turn (the CLI, MCP tools) that route a tenant's or
     channel's resources natively only where the operator authorized it. The
@@ -258,8 +344,7 @@ def authorized_deployments(tenant_id: str) -> tuple[OpenAIDeployment, ...]:
         return tuple(
             OpenAIDeployment.model_validate(row)
             for row in _MANIFEST.validate_json(raw)
-            if row.get("profile") == "openai.persistent_workspace"
-            and row.get("tenant_id") == tenant_id
+            if row.get("profile") == profile and row.get("tenant_id") == tenant_id
         )
     except (OSError, ValidationError):
         return ()
@@ -292,6 +377,7 @@ def build_openai_runtime(request: ProviderPreparationRequest) -> OpenAIHostRunti
     scope = request.scope
     worker_agent: ResourceRef | None = None
     allocating = False
+    counterpart_verified = False
 
     def check(config: ConfigRevision, authorized: Scope) -> None:
         if config != revision or authorized != scope:
@@ -300,6 +386,8 @@ def build_openai_runtime(request: ProviderPreparationRequest) -> OpenAIHostRunti
     async def plan(preparation: ProviderPreparationRequest) -> SessionSpec:
         if preparation.admission.backend_revision != revision or preparation.scope != scope:
             raise ScopeViolation(request.thread_id, "native plan differs from admitted turn")
+        if deployment.source_capabilities is not None and not counterpart_verified:
+            raise AdmissionDenied(reason="backend_unsupported")
 
         def ref(id_: str, kind: str) -> ResourceRef:
             return ResourceRef(
@@ -343,7 +431,11 @@ def build_openai_runtime(request: ProviderPreparationRequest) -> OpenAIHostRunti
         return SessionSpec(
             agent=agent,
             agent_revision=Revision(local=0),
-            environment=ref(deployment.environment_id, "environment"),
+            environment=(
+                ref(deployment.environment_id, "environment")
+                if deployment.environment_id is not None
+                else None
+            ),
             config_revision=revision.local,
         )
 
@@ -377,6 +469,8 @@ def build_openai_runtime(request: ProviderPreparationRequest) -> OpenAIHostRunti
         return configured_transport(api_key=secret, project=deployment.project)
 
     async def read(preparation: ProviderPreparationRequest) -> AgentRevision:
+        nonlocal counterpart_verified
+        counterpart_verified = False
         validate_counterpart_request(
             deployment, preparation, worker_materialization=deployment.worker_materialization
         )
@@ -404,7 +498,40 @@ def build_openai_runtime(request: ProviderPreparationRequest) -> OpenAIHostRunti
             account_scope_id=deployment.project,
             operation_key="counterpart-read",
         )
-        return await deployment.read_counterpart(preparation, source=source, resources=resources)
+        checked = await deployment.read_counterpart(preparation, source=source, resources=resources)
+        counterpart_verified = True
+        return checked
+
+    async def resolve_mcp(authorized: Scope, reference: str, destination: str) -> str:
+        capabilities = deployment.source_capabilities
+        public_url = request.deps.mcp.public_url
+        if (
+            not counterpart_verified
+            or authorized != scope
+            or capabilities is None
+            or deployment.source_agent_id is None
+            or reference
+            != f"caller-mcp:{scope.tenant_id}:{scope.account_id}:{deployment.source_agent_id}"
+            or public_url is None
+            or destination.rstrip("/") != str(public_url).rstrip("/")
+            or request.deps.mcp.jwt_secret is None
+            or deployment.mcp_credential_file is None
+        ):
+            raise ScopeViolation("mcp-credential", "MCP credential has no verified source binding")
+        try:
+            return await resolve_agent_mcp_credential(
+                request.deps.sessionmaker,
+                path=deployment.mcp_credential_file,
+                secret=request.deps.mcp.jwt_secret.get_secret_value().encode(),
+                scope=scope,
+                agent_id=deployment.source_agent_id,
+                destination=destination,
+                tools=capabilities.mcp_tools,
+                chat_execution=True,
+                now=request.now(),
+            )
+        except (OSError, ValueError):
+            raise ScopeViolation("mcp-credential", "invalid scoped MCP credential") from None
 
     async def materialize(preparation: ProviderPreparationRequest) -> AgentRevision:
         nonlocal allocating, worker_agent
@@ -437,13 +564,14 @@ def build_openai_runtime(request: ProviderPreparationRequest) -> OpenAIHostRunti
         journal=OpenAIRecoveryJournal(),
         usage_store=OpenAIUsageRevisions(),
         account_scope_id=deployment.project,
-        price=provider_prices(PROFILE).get((revision.backend, revision.model)),
+        price=provider_prices(deployment.profile).get((revision.backend, revision.model)),
         session_plan=plan,
         authorization=authorize,
+        mcp_secrets=resolve_mcp if deployment.source_capabilities is not None else None,
         controls=SessionControls(
             model="gpt-6-luna",
             multi_agent_enabled=False,
-            container_size="small",
+            container_size="small" if deployment.profile == PROFILE else None,
             spend_limit_usd_cents=spend_limit,
             require_spend_control_echo=budget is not None,
         ),
@@ -457,10 +585,11 @@ def register_runtime() -> None:
     from daimon.core.turn.runtimes import register_channel_runtime
 
     register_host()
-    register_channel_runtime(
-        PROFILE,
-        build_openai_runtime,
-        authorizations=authorized_deployments,
-        tariffs=partial(provider_prices, PROFILE),
-        fallback=True,
-    )
+    for profile in PROFILES:
+        register_channel_runtime(
+            profile,
+            build_openai_runtime,
+            authorizations=partial(authorized_deployments, profile=profile),
+            tariffs=partial(provider_prices, PROFILE) if profile == PROFILE else None,
+            fallback=True,
+        )

@@ -69,6 +69,7 @@ from daimon.core.context_prompt import TurnContext, context_prompt
 from daimon.core.continuity.wakes import enqueue_worker_finished
 from daimon.core.fleet import TERMINAL, FleetConflict, FleetWorker, spawn_operation_key, worker_slot
 from daimon.core.github_app_session import close_headless_app_session
+from daimon.core.model_presets import model_choice_id
 from daimon.core.mux_backend import managed_agents, resource_ref, resource_scope
 from daimon.core.mux_compat import legacy_call, sdk_agent, sdk_environment
 from daimon.core.neutral_resources import WorkerPermissions, resolve_worker_spec
@@ -97,12 +98,15 @@ from daimon.core.turn.prepare import PreparedTurn, ProviderPreparationRequest, b
 from daimon.core.turn.run import (
     _archive_orphaned_session,  # pyright: ignore[reportPrivateUsage]
     _turn_port_kwargs,  # pyright: ignore[reportPrivateUsage]
+    _with_prefix,  # pyright: ignore[reportPrivateUsage]
     run_prepared_turn,
 )
 from daimon.core.turn.runtime_manifest import capture_preparation_source
 from daimon.core.turn.state import TurnState, extract_final_response
 from daimon.core.turn.termination import TerminationReason
+from mux.contracts.actions import UserMessage
 from mux.contracts.config import BackendConfig
+from mux.contracts.events import TextPart
 from mux.contracts.ids import Scope
 from mux.contracts.resources import Agent, AgentPatch, AgentSpec, ProviderBinding
 from mux.errors import ScopeViolation
@@ -445,11 +449,11 @@ async def run_turn_impl(
     try:
         if (observation := current_outcome.get()) is not None:
             observation.session_id = session.id
-            observation.model_by_session[session.id] = session.agent.model.id
+            observation.model_by_session[session.id] = model_choice_id(session.agent.model)
 
         usage_record: Callable[..., Awaitable[object]] | None = None
         if usage_record_factory is not None:
-            usage_record = usage_record_factory(session.id, session.agent.model.id)
+            usage_record = usage_record_factory(session.id, model_choice_id(session.agent.model))
 
         billing: BillingPosture
         if usage_record is not None:
@@ -782,13 +786,14 @@ async def run_worker(
                 key: str,
                 fence: Lease | None,
             ) -> bool:
-                if prepared is None:
-                    return True
-                turn_key = f"turn:{prepared.ma_session_id}:{operation}:"
-                primary = turn_key + "send:"
+                turn_key = (
+                    f"turn:{prepared.ma_session_id}:{operation}:" if prepared is not None else None
+                )
+                primary = (turn_key or f"{operation}:") + "send:"
                 if not key.startswith(primary):
                     return not (
                         resolved.limits.native_budget_usd is not None
+                        and turn_key is not None
                         and key.startswith(turn_key)
                         and not key[len(turn_key) :].startswith(
                             ("cancel:", "archive:", "recovery-stop:", "recovery-interrupt:")
@@ -809,6 +814,7 @@ async def run_worker(
                     tenant_id=request.tenant_id,
                     worker_id=worker.id,
                     expected_version=verdict.worker.version,
+                    expected_status="starting" if prepared is None else "running",
                 )
                 return True
 
@@ -858,6 +864,18 @@ async def run_worker(
                                 now=request.now,
                                 worker=resolved,
                                 before_native=guard,
+                                initial_input=UserMessage(
+                                    content=(
+                                        TextPart(
+                                            text=_with_prefix(
+                                                context_prompt(
+                                                    "worker", system=admission.agent.system
+                                                ),
+                                                trigger_message,
+                                            )
+                                        ),
+                                    )
+                                ),
                                 _on_prepared=bound_session,
                                 _on_orphan=orphan,
                             )

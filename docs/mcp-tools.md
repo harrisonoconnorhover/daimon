@@ -1,6 +1,6 @@
 # MCP tool catalogue
 
-The 125 tools Daimon's MCP server registers, plus the 8 on the hub login mounts.
+The 115 tools Daimon's MCP server registers, plus the 8 on the hub login mounts.
 Generated from the live registry by `scripts/generate_mcp_tool_catalogue.py` — edit the
 tool's docstring, not this page. CI fails when the two disagree.
 
@@ -16,7 +16,6 @@ tool is hidden by default and restored only for a matching caller.
 
 - **admin only** — carries the `admin` tag.
 - **agent tokens only** — carries the `agent-chat` tag.
-- **channel admins too** — carries the `channel-admin` tag.
 - **Discord callers** — carries the `discord` tag.
 - **operator tokens with agents:archive** — carries the `scope:agents:archive` tag.
 - **operator tokens with channels:write** — carries the `scope:channels:write` tag.
@@ -72,9 +71,9 @@ Admin tools for one agent's third-party MCP tool rules.
 
 | Tool | Who can call it | Purpose |
 | --- | --- | --- |
-| `clear_agent_tool_rule` | admin only, channel admins too, operator tokens with channels:write | Clear one agent's tool rule. |
-| `list_agent_tool_rules` | admin only, channel admins too, operator tokens with tenant:read | List an agent's rules. |
-| `set_agent_tool_rule` | admin only, channel admins too, operator tokens with channels:write | Set one agent's tool rule. |
+| `clear_agent_tool_rule` | admin only, operator tokens with channels:write | Clear one agent's tool rule. |
+| `list_agent_tool_rules` | admin only, operator tokens with tenant:read | List an agent's tool rules, optionally for one channel. |
+| `set_agent_tool_rule` | admin only, operator tokens with channels:write | Set one agent's tool rule. |
 
 ## `agents`
 
@@ -89,16 +88,6 @@ Agent tools: list / get / create / update / fork / archive.
 | `get_agent` | all callers | Show what an agent can access: attached MCP servers and skills. |
 | `list_agents` | all callers | List agents visible here, including their attached ``mcp_servers`` and ``skills``. |
 | `update_agent` | all callers | Change an agent's system prompt or switch its model; add existing skills such as build-models. |
-
-## `channel_admins`
-
-Channel admin tools: who administers one channel on top of the server admins.
-
-| Tool | Who can call it | Purpose |
-| --- | --- | --- |
-| `clear_channel_admins` | admin only, operator tokens with channels:write | Remove every channel admin from one channel, leaving it to the server admins. |
-| `list_channel_admins` | admin only, operator tokens with tenant:read | List the channels that have their own admins, with the groups and members named for each. |
-| `set_channel_admins` | admin only, operator tokens with channels:write | Name who administers one channel, on top of the server admins. |
 
 ## `channel_budgets`
 
@@ -125,8 +114,8 @@ Channel environment tools: which environment a channel's turns run in.
 
 | Tool | Who can call it | Purpose |
 | --- | --- | --- |
-| `clear_channel_environment` | admin only, channel admins too, operator tokens with channels:write | Stop a channel picking its own environment, so it uses the workspace default. |
-| `set_channel_environment` | admin only, channel admins too, operator tokens with channels:write | Choose the environment a channel's turns run in, or the workspace default. |
+| `clear_channel_environment` | admin only, operator tokens with channels:write | Stop a channel picking its own environment, so it uses the workspace default. |
+| `set_channel_environment` | admin only, operator tokens with channels:write | Choose the environment a channel's turns run in, or the workspace default. |
 
 ## `channel_rules`
 
@@ -183,16 +172,6 @@ Post requester-only private forms for agent keys, MCP tokens and GitHub access.
 | `request_agent_key` | Discord callers, Slack callers, Teams callers | Give an agent an API key or token for any service: Toggl, OpenAI, Higgsfield, or a platform that just launched. |
 | `request_mcp_oauth` | Discord callers, Slack callers, Teams callers | Connect an agent to an MCP server that signs people in through the browser, such as Notion, Slack or Atlassian. |
 | `request_mcp_token` | Discord callers, Slack callers, Teams callers | Connect an agent such as research-bot to Linear through an MCP endpoint with a bearer token, not browser OAuth. |
-| `request_repo_binding` | Discord callers, Slack callers, Teams callers | Legacy: save a GitHub token for an agent that already uses one. |
-| `request_skill_repo_token` | Discord callers, Slack callers, Teams callers | The skills repo is private: collect a GitHub token to import its skills. |
-
-## `enable_files`
-
-`enable_channel_files`: the agent asks for the Teams Enable files card.
-
-| Tool | Who can call it | Purpose |
-| --- | --- | --- |
-| `enable_channel_files` | Teams callers | Post the Enable files card in this Teams channel, right after your reply. |
 
 ## `environments`
 
@@ -307,9 +286,9 @@ Propagation tools: set and clear agent defaults at workspace or channel scope.
 
 | Tool | Who can call it | Purpose |
 | --- | --- | --- |
-| `clear_agent_default` | admin only, channel admins too, operator tokens with channels:write | Stop an agent answering in a channel by clearing its default routing. |
+| `clear_agent_default` | admin only, operator tokens with channels:write | Stop an agent answering in a channel by clearing its default routing. |
 | `explain_agent_resolution` | all callers | Who answers in this channel, for example #growth? Report who answers, the environment it runs in, and which routing tier decided each. |
-| `set_agent_default` | admin only, channel admins too, operator tokens with channels:write | Make an agent answer in a channel or become the whole server/workspace default. |
+| `set_agent_default` | admin only, operator tokens with channels:write | Make an agent answer in a channel or become the whole server/workspace default. |
 
 ## `publish`
 
@@ -319,14 +298,6 @@ Report publishing MCP tools.
 | --- | --- | --- |
 | `delete_report` | all callers | Un-publish a report you published. |
 | `publish_report` | all callers | Publish a report: a page where the named people can read it and ask it questions. |
-
-## `repo_binding`
-
-Bind an agent to a public GitHub repo from inside an ordinary chat turn.
-
-| Tool | Who can call it | Purpose |
-| --- | --- | --- |
-| `bind_public_repo` | Discord callers, Slack callers, Teams callers | Have an agent work in a public GitHub repo: "work in github.com/owner/project", "point it at our open-source repository". |
 
 ## `routines`
 
@@ -342,18 +313,14 @@ Routines tools: create / list / get / update / delete.
 
 ## `self_edit`
 
-MCP tools for an agent to edit its own ``agent_files`` and manage its
-``agent_repo_binding`` from inside an MA turn.
+MCP tools for an agent to edit its own ``agent_files`` from inside an MA turn.
 
 | Tool | Who can call it | Purpose |
 | --- | --- | --- |
-| `clear_repo_binding` | agent tokens only | Remove the repo binding for your agent. |
-| `get_repo_binding` | agent tokens only | Return the current repo binding for your agent, or null if unbound. |
 | `self_delete_file` | agent tokens only | Delete a per-agent key by `key`. |
 | `self_list_files` | agent tokens only | List all keys + metadata (no values) in your private agent_files namespace. |
 | `self_read_file` | agent tokens only | Check a per-agent file by `key`. |
 | `self_write_file` | agent tokens only | Add a per-agent key under `key`. |
-| `set_repo_binding` | agent tokens only | Bind your agent to a git repo. |
 
 ## `sessions`
 

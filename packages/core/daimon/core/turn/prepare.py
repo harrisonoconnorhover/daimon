@@ -43,6 +43,7 @@ from daimon.core.channel_backend import BackendUnsupported
 from daimon.core.config import load_turn_settings
 from daimon.core.confirmation import backend_switch_tools_for_turn
 from daimon.core.credential_env import assemble_env_bytes
+from daimon.core.github_app_session import AppSessionAccess
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.mux_backend import TurnRuntime, managed_agents, resource_ref, resource_scope
 from daimon.core.mux_compat import legacy_call, retrieve_agent, sdk_agent
@@ -71,7 +72,7 @@ from daimon.core.stores.access_policy import load_access_policy
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.agent_memory_stores import get_personal_memory_store_id
 from daimon.core.stores.domain import BackendAgent, TransferKind
-from daimon.core.stores.github_access import get_agent_mode, list_authorized_repos
+from daimon.core.stores.github_access import list_authorized_repos
 from daimon.core.stores.github_issued_tokens import list_session_tokens
 from daimon.core.stores.thread_sessions import (
     create_thread_session,
@@ -90,6 +91,7 @@ from daimon.core.turn.runtimes import ensure_channel_runtime, scope_channel_runt
 from daimon.core.turn_origin import SessionState
 from daimon.core.usage_billing import ObservationRecorder
 from daimon.core.usage_recording import record_turn_usage
+from mux.contracts.actions import UserMessage
 from mux.contracts.ids import ResourceRef, Revision, Scope
 from mux.contracts.ports import ManagedAgents
 from mux.contracts.resources import Agent, AgentSpec, SessionSpec
@@ -213,6 +215,7 @@ class ProviderPreparationRequest:
     )
     source: BackendAgent | None = field(default=None, kw_only=True, compare=False, repr=False)
     worker: ResolvedWorkerSpec | None = field(default=None, kw_only=True, compare=False, repr=False)
+    initial_input: UserMessage | None = field(default=None, kw_only=True, compare=False, repr=False)
     native_budget_usd: Decimal | None = field(default=None, kw_only=True, compare=False, repr=False)
     target_spec: AgentSpec | None = field(default=None, kw_only=True, compare=False, repr=False)
     root_controls: dict[str, JsonValue] | None = field(
@@ -412,9 +415,7 @@ async def _env_bytes_sha256(
     """
     async with deps.sessionmaker() as session:
         rows = await list_agent_files(session, tenant_id=tenant_id, agent_id=agent_uuid)
-        mode = await get_agent_mode(session, tenant_id=tenant_id, agent_id=agent_uuid)
-    if mode == "app":
-        rows = [row for row in rows if row.key not in ("GH_TOKEN", "GITHUB_TOKEN")]
+    rows = [row for row in rows if row.key not in ("GH_TOKEN", "GITHUB_TOKEN")]
     if not rows:
         return None
     return hash_env_bytes(assemble_env_bytes(rows))
@@ -585,12 +586,17 @@ async def create_ma_session(
         if preparation is not None and preparation.source is not None
         else derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(admission.agent.id))
     )
-    async with deps.sessionmaker() as session:
-        github_mode = await get_agent_mode(session, tenant_id=tenant_id, agent_id=agent_uuid)
+    github_mode = "app"
     env_sha256 = await _env_bytes_sha256(deps, tenant_id=tenant_id, agent_uuid=agent_uuid)
     native_controls: _NativeBudgetArgs = {}
     if preparation is not None and preparation.native_budget_usd is not None:
         native_controls["native_budget_usd"] = preparation.native_budget_usd
+    excluded_repo_urls: tuple[str, ...] = ()
+
+    def capture_app_access(access: AppSessionAccess) -> None:
+        nonlocal excluded_repo_urls
+        excluded_repo_urls = access.excluded_repo_urls
+
     ma_session = await create_session(
         deps.anthropic,
         agent=admission.agent,
@@ -624,6 +630,7 @@ async def create_ma_session(
         origin_thread_id=admission.origin_thread_id,
         origin_seal_ids=frozenset(seal),
         before_create=fence,
+        on_app_access=capture_app_access,
         channel_skills=admission.channel_skills,
         resource_source=preparation.source
         if preparation is not None and preparation.worker is not None
@@ -690,7 +697,15 @@ async def create_ma_session(
         personal_memory_store_ids=(
             () if personal_memory_store_id is None else (personal_memory_store_id,)
         ),
-    ).model_copy(update={"token_repo_urls": token_repo_urls})
+    ).model_copy(
+        update={
+            "token_repo_urls": token_repo_urls,
+            "unavailable_repos": tuple(
+                (url, dt.datetime.now(dt.UTC)) for url in excluded_repo_urls
+            ),
+            "unavailable_notice_pending": excluded_repo_urls,
+        }
+    )
     return CreatedSession(
         ma_session_id=ma_session.id,
         snapshot=snapshot,
@@ -990,7 +1005,6 @@ async def _shared_thread(
         or admission.config.thread_binding_kind == "setup"
     ):
         return None
-    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(admission.agent.id))
     async with deps.sessionmaker() as session:
         try:
             shared = await resolve_shared_thread(
@@ -1006,8 +1020,6 @@ async def _shared_thread(
             raise AdmissionDenied(reason="backend_unsupported") from err
         if shared is None:
             return None
-        if await get_agent_mode(session, tenant_id=tenant_id, agent_id=agent_uuid) != "app":
-            raise AdmissionDenied(reason="backend_unsupported")
     return shared
 
 
@@ -1166,6 +1178,7 @@ async def bind_session_impl(
     _on_orphan: Callable[[PreparedTurn], Awaitable[None]] | None = None,
     worker: ResolvedWorkerSpec | None = None,
     before_native: Callable[[], Awaitable[None]] | None = None,
+    initial_input: UserMessage | None = None,
     turn_card_intent_id: uuid.UUID | None = None,
 ) -> PreparedTurn:
     """Find-or-create the MA session for this turn and bind its recorder.
@@ -1247,6 +1260,7 @@ async def bind_session_impl(
         now,
         worker=worker,
         before_native=before_native,
+        initial_input=initial_input,
     )
     from daimon.core.turn.runtime_manifest import (
         prepare_controlled_root,
@@ -1481,7 +1495,7 @@ async def bind_session_impl(
                     tenant_id=tenant_id,
                     external_user_id=external_user_id,
                     ma_session_id=fresh.ma_session_id,
-                    model_id=fresh.snapshot.model_id,
+                    model_id=fresh.snapshot.pricing_id,
                     channel_id=admission.budget_channel_id,
                 ),
                 session_ref=resource_ref(backend, "session", fresh.ma_session_id, scope=scope),

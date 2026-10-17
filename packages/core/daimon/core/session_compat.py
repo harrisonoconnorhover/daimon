@@ -28,7 +28,7 @@ Pure module: no I/O and no clock. `now` is injected, and must be timezone-aware.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
 from daimon.core.session_snapshot import SessionSnapshot
@@ -93,13 +93,6 @@ class RemirrorVaultCredentials:
 
 
 @dataclass(frozen=True, slots=True)
-class RotateRepoToken:
-    """Mint a fresh clone token for the mounted repository resource."""
-
-    resource_id: str
-
-
-@dataclass(frozen=True, slots=True)
 class RotateAppTokens:
     """Refresh App tokens and swap every mounted repository resource in place."""
 
@@ -116,11 +109,7 @@ class ReplaceEnvFile:
 
 
 type UpdateOp = (
-    ReplaceToolsAndMcpServers
-    | RemirrorVaultCredentials
-    | RotateRepoToken
-    | RotateAppTokens
-    | ReplaceEnvFile
+    ReplaceToolsAndMcpServers | RemirrorVaultCredentials | RotateAppTokens | ReplaceEnvFile
 )
 
 
@@ -147,20 +136,43 @@ class ReplaceSession:
 type CompatibilityDecision = ReuseAsIs | UpdateInPlace | ReplaceSession
 
 
+UNAVAILABLE_RETRY_AFTER = timedelta(minutes=60)  # First refusal expires after one token lifetime.
+
+
+def valid_unavailable_repo_urls(recorded: SessionSnapshot, *, now: datetime) -> tuple[str, ...]:
+    return tuple(
+        url
+        for url, since in recorded.unavailable_repos
+        if since.tzinfo is not None
+        and since.tzinfo.utcoffset(since) is not None
+        and now - since < UNAVAILABLE_RETRY_AFTER
+    )
+
+
+def _without(urls: tuple[str, ...], excluded: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(url for url in urls if url not in excluded) if excluded else urls
+
+
 def identity_change_reasons(
-    recorded: SessionSnapshot, desired: SessionSnapshot
+    recorded: SessionSnapshot, desired: SessionSnapshot, *, now: datetime | None = None
 ) -> tuple[ChangeReason, ...]:
     """Every identity-axis field that differs, in a fixed, user-facing order."""
+    excluded = () if now is None else valid_unavailable_repo_urls(recorded, now=now)
     checks: tuple[tuple[bool, ChangeReason], ...] = (
         (recorded.ma_agent_id != desired.ma_agent_id, "agent_identity"),
-        (recorded.model_id != desired.model_id, "model"),
+        (
+            recorded.model_id != desired.model_id or recorded.model_speed != desired.model_speed,
+            "model",
+        ),
         (recorded.system_sha256 != desired.system_sha256, "system_prompt"),
         (recorded.skills_sha256 != desired.skills_sha256, "skills"),
         (recorded.environment_id != desired.environment_id, "environment"),
         (recorded.github_mode != desired.github_mode, "github_mode"),
         (
-            recorded.repo_urls != desired.repo_urls
-            or recorded.token_repo_urls != desired.token_repo_urls,
+            # Repos GitHub refused at mint stay excluded instead of replacing the
+            # session every turn; reconciliation then removes them from desired.
+            recorded.repo_urls != _without(desired.repo_urls, excluded)
+            or recorded.token_repo_urls != _without(desired.token_repo_urls, excluded),
             "repo_set",
         ),
         (recorded.repo_url != desired.repo_url, "repo_url"),
@@ -200,7 +212,7 @@ def decide_session_compatibility(
     if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
         raise ValueError("now must be timezone-aware")
 
-    identity_reasons = identity_change_reasons(recorded, desired)
+    identity_reasons = identity_change_reasons(recorded, desired, now=now)
     if identity_reasons:
         return ReplaceSession(reasons=identity_reasons)
 
@@ -245,17 +257,6 @@ def decide_session_compatibility(
                 ops.append(RotateAppTokens(resource_ids=recorded.repo_resource_ids))
             else:
                 must_replace = True
-
-    repo_resource_id = recorded.repo_resource_id if recorded.github_mode == "legacy" else None
-    token_issued_at = recorded.repo_token_issued_at
-    token_age_s = None if token_issued_at is None else now.timestamp() - token_issued_at
-    token_is_stale = token_age_s is not None and token_age_s > repo_token_max_age_s
-    if repo_resource_id is not None and token_is_stale:
-        reasons.append("repo_token_age")
-        if capabilities.repo_token_rotatable:
-            ops.append(RotateRepoToken(resource_id=repo_resource_id))
-        else:
-            must_replace = True
 
     if must_replace:
         return ReplaceSession(reasons=tuple(reasons))

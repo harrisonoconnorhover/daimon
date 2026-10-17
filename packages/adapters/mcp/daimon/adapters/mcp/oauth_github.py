@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -10,19 +11,21 @@ import json
 import logging
 import secrets
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal, cast
 from urllib.parse import parse_qs, urlencode
 
 import httpx
 from anthropic import APIError, AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
-from cryptography.fernet import MultiFernet
+from cryptography.fernet import InvalidToken, MultiFernet
 from daimon.adapters.mcp.github_pages import github_page
+from daimon.adapters.mcp.tools.teams._client import TeamsBotClient
 from daimon.adapters.mcp.web_icons import icon, platform_mark
 from daimon.core.agent_pins import agent_pin_names
-from daimon.core.channel_admins import GroupMembers
 from daimon.core.config import Settings
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
@@ -39,16 +42,21 @@ from daimon.core.github_connect_cards import (
 from daimon.core.github_credentials import decrypt_token, encrypt_token
 from daimon.core.github_panel import requester_manages_agent
 from daimon.core.github_requester_access import list_github_pages
+from daimon.core.native_admins import AdminAttestationUnavailable, attest_discord_admin
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores import github_access, github_app_installations, github_connect
 from daimon.core.stores.accounts import get_account_with_tenant, has_external_accounts
 from daimon.core.stores.domain import AccountIdentityRow, Role
 from daimon.core.stores.github_access import list_agent_repos
+from daimon.core.stores.github_installation_reconciliation import enqueue as enqueue_reconciliation
 from daimon.core.stores.github_request_actions import finish_confirmed_requests
 from daimon.core.stores.security_audit import append_event
+from daimon.core.stores.slack_bot_tokens import get_slack_bot_token
+from daimon.core.teams_graph import GraphClient, GraphUnavailable
+from mux.drivers import isolated_ssl_context
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
@@ -57,6 +65,108 @@ RouteHandler = Callable[[Request], Awaitable[Response]]
 ClientFactory = Callable[[], httpx.AsyncClient]
 _COOKIE = "daimon_gh_connect"
 _log = logging.getLogger(__name__)
+_ADMIN_RETRY = "Couldn't confirm you're still a server or workspace admin. Try again in a minute."
+
+
+async def _attest_native_admin(
+    *,
+    requester: AccountIdentityRow,
+    settings: Settings,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+    http_client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Read native authority for the invitation's bound principal, outside a write transaction."""
+    user_id = requester.platform_user_id
+    if user_id is None:
+        raise AdminAttestationUnavailable("platform principal unavailable")
+    if requester.platform == "discord":
+        return await attest_discord_admin(
+            guild_id=requester.external_id,
+            platform_user_id=user_id,
+            settings=settings,
+            http_client=http_client,
+        )
+    if requester.platform == "slack":
+        try:
+            async with sessionmaker() as session:
+                row = await get_slack_bot_token(session, team_id=requester.external_id)
+        except SQLAlchemyError as exc:
+            raise AdminAttestationUnavailable("workspace bot token lookup failed") from exc
+        if row is None:
+            raise AdminAttestationUnavailable("workspace bot token unavailable")
+        try:
+            token = decrypt_token(fernet, row.encrypted_token)
+        except InvalidToken as exc:
+            raise AdminAttestationUnavailable("workspace bot token unavailable") from exc
+
+        async def slack_lookup(client: httpx.AsyncClient) -> object:
+            response = await client.get(
+                "https://slack.com/api/users.info",
+                params={"user": user_id},
+                headers={"Authorization": f"Bearer {token}"},
+                follow_redirects=False,
+                timeout=5,
+            )
+            response.raise_for_status()
+            return cast(object, response.json())
+
+        try:
+            async with asyncio.timeout(10):
+                if http_client is None:
+                    async with httpx.AsyncClient(
+                        trust_env=False, verify=isolated_ssl_context()
+                    ) as client:
+                        payload = await slack_lookup(client)
+                else:
+                    payload = await slack_lookup(http_client)
+            if (
+                not isinstance(payload, dict)
+                or cast(dict[str, object], payload).get("ok") is not True
+            ):
+                raise ValueError("Slack lookup did not succeed")
+            user = cast(dict[str, object], payload).get("user")
+            if not isinstance(user, dict) or cast(dict[str, object], user).get("id") != user_id:
+                raise ValueError("Unbound Slack user")
+            user = cast(dict[str, object], user)
+            if user.get("deleted"):
+                return False
+            flags = ("is_admin", "is_owner", "is_primary_owner")
+            if any(type(user.get(flag)) is not bool for flag in flags):
+                raise ValueError("Missing Slack admin facts")
+            return any(user[flag] for flag in flags)
+        except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+            raise AdminAttestationUnavailable("Slack lookup failed") from exc
+    if requester.platform == "teams":
+        teams = settings.teams
+        if teams is None or teams.admin_team_id is None:
+            raise AdminAttestationUnavailable("Teams admin team unavailable")
+        if requester.external_id.lower() != teams.tenant_id.lower():
+            return False
+        admin_team_id = teams.admin_team_id
+
+        async def teams_lookup(client: httpx.AsyncClient) -> frozenset[str]:
+            bot = TeamsBotClient(
+                client,
+                client_id=teams.client_id,
+                client_secret=teams.client_secret.get_secret_value(),
+                tenant_id=teams.tenant_id,
+            )
+            return await GraphClient(client, bot.graph_token).list_team_owner_ids(admin_team_id)
+
+        try:
+            async with asyncio.timeout(15):
+                if http_client is None:
+                    async with httpx.AsyncClient(
+                        trust_env=False, verify=isolated_ssl_context()
+                    ) as client:
+                        owners = await teams_lookup(client)
+                else:
+                    owners = await teams_lookup(http_client)
+            return user_id.lower() in owners
+        except (GraphUnavailable, httpx.HTTPError, TimeoutError, ValueError) as exc:
+            raise AdminAttestationUnavailable("Teams lookup failed") from exc
+    raise AdminAttestationUnavailable("unsupported platform")
 
 
 @dataclass(frozen=True)
@@ -203,32 +313,25 @@ def _already_connected_page(
     back: str = "",
     *,
     agent_name: str | None = None,
-    update_pending: bool = False,
-    missing_repos: tuple[tuple[str, bool], ...] = (),
 ) -> Response:
-    label = "Connection needs one more repo" if update_pending else "Already connected"
     status = (
-        "Setup is incomplete."
-        if update_pending
-        else f"{_repo_count(count)} connected to {html.escape(agent_name)}."
+        f"{_repo_count(count)} connected to {html.escape(agent_name)}."
         if agent_name and count is not None
         else "GitHub repos are connected."
     )
     action = (
-        "Ask the requester to finish connecting the required repos."
-        if update_pending
-        else "Return to Discord to use the agent."
+        "Return to Discord to use the agent."
         if "discord.com/channels/" in back and agent_name
         else "In Slack, run /github to use the agent."
         if back and agent_name
         else "You can close this tab."
     )
     return github_page(
-        title=label,
+        title="Already connected",
         heading_icon=True,
         body_html=f'<div class="gh-status-icon">{icon("circle-check")}</div>'
         + f'<p class="gh-status-line">{status}</p><p class="gh-action-line">{action}</p>'
-        + (f'<div class="gh-actions">{back}</div>' if back and not update_pending else ""),
+        + (f'<div class="gh-actions">{back}</div>' if back else ""),
     )
 
 
@@ -240,26 +343,8 @@ def _done_page(
     requester_label: str,
     same_person: bool,
     agent_name: str | None,
-    update_pending: bool,
-    retired_saved_key: bool = False,
-    missing_repos: tuple[tuple[str, bool], ...] = (),
 ) -> Response:
     back = _back_to_chat(platform, external_id)
-    if update_pending and agent_name:
-        return github_page(
-            title="Repos connected",
-            heading_icon=True,
-            body_html=(
-                f'<div class="gh-status-icon">{icon("circle-check")}</div>'
-                f'<p class="gh-status-line">{_repo_count(count)} connected to '
-                f"{html.escape(agent_name)}.</p>"
-                '<p class="gh-action-line">An operator will finish switching the agent. '
-                "You can close this tab.</p>"
-                '<details class="gh-access-help"><summary>How this works</summary>'
-                "<p>The agent keeps its current GitHub connection until setup is complete.</p>"
-                "</details>"
-            ),
-        )
     if agent_name:
         actions = (
             '<div class="gh-actions">' + back + "</div>"
@@ -406,24 +491,14 @@ def _snapshot_signature(state: str, invitation_hash: str, snapshot: str, secret:
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
-def _saved_agent_page(
-    name: str,
-    grants: list[github_access.AgentRepo],
-    missing: tuple[tuple[str, bool], ...] = (),
-    pending: bool = False,
-) -> Response:
+def _saved_agent_page(name: str, grants: list[github_access.AgentRepo]) -> Response:
     body = (
         '<div class="gh-status-icon">'
         + icon("circle-check")
         + "</div>"
         + f'<p class="gh-status-line">{html.escape(name)} can use '
         + f"{_repo_count(len(grants))}.</p>"
-        + (
-            '<p class="gh-action-line">An operator will finish switching the agent. '
-            "You can close this tab.</p>"
-            if pending or missing
-            else '<p class="gh-action-line">You can close this tab.</p>'
-        )
+        + '<p class="gh-action-line">You can close this tab.</p>'
     )
     return github_page(title="Repos saved", body_html=body, heading_icon=True)
 
@@ -754,11 +829,7 @@ def _agent_editor_page(
         ),
         None,
     )
-    repairable = [
-        repo
-        for repo in grants
-        if repo.repo_id in usable and (repo.staged or repo.repo_id in needed)
-    ]
+    repairable = [repo for repo in grants if repo.repo_id in usable and repo.repo_id in needed]
     working = next((repo for repo in grants if repo.is_working_repo), None)
     may_change_working = working is None or working.repo_id in usable
     place = _place_label(platform)
@@ -869,9 +940,7 @@ def _agent_editor_page(
             f"{icon('folder')}Working repo</span>"
             '<span class="gh-pending-label" aria-live="polite"></span>'
         )
-        if repo.staged:
-            parts.append('<span class="gh-repo-state">Setup pending</span>')
-        elif repo.status != "active":
+        if repo.status != "active":
             parts.append('<span class="gh-repo-state">Unavailable</span>')
         parts.append("</div>")
         if not editable:
@@ -1365,7 +1434,6 @@ def build_oauth_github_routes(
     client_factory: ClientFactory | None = None,
     deployment_default: DeploymentDefault | None = None,
     anthropic: AsyncAnthropic | None = None,
-    group_members: Callable[[str, str], GroupMembers | None] | None = None,
 ) -> tuple[RouteHandler, RouteHandler, RouteHandler, RouteHandler]:
     """Build connect, callback, setup and confirmation handlers."""
     config = settings.github_app
@@ -1430,11 +1498,6 @@ def build_oauth_github_routes(
         if deployment_default is None:
             return False
         metadata = live.metadata if live is not None else {}
-        members = (
-            group_members(requester.platform, requester.external_id)
-            if group_members is not None
-            else None
-        )
         return await requester_manages_agent(
             session,
             tenant_id=invitation.tenant_id,
@@ -1447,39 +1510,7 @@ def build_oauth_github_routes(
             is_daimon_managed=(
                 None if live is None else metadata.get(MA_METADATA_KEY_MANAGED) == "true"
             ),
-            members=members,
             other_names=agent_pin_names(live.name, metadata) if live is not None else (),
-        )
-
-    async def _missing(
-        session: AsyncSession, invitation: github_connect.Invitation
-    ) -> tuple[tuple[str, bool], ...]:
-        """The working and skill repos the agent still needs before it can drop its old key."""
-        if invitation.agent_id is None:
-            return ()
-        if (
-            invitation.activation_status != "update_pending"
-            and not await github_connect.has_saved_github_state(
-                session, tenant_id=invitation.tenant_id, agent_id=invitation.agent_id
-            )
-        ):
-            return ()
-        return tuple(
-            (missing.full_name, missing.needs_write)
-            for missing in await github_connect.missing_required_repos(
-                session, tenant_id=invitation.tenant_id, agent_id=invitation.agent_id
-            )
-        )
-
-    async def _key_pending(session: AsyncSession, invitation: github_connect.Invitation) -> bool:
-        if invitation.agent_id is None:
-            return False
-        if invitation.activation_status == "update_pending":
-            return True
-        return await github_access.get_agent_mode(
-            session, tenant_id=invitation.tenant_id, agent_id=invitation.agent_id
-        ) == "legacy" and await github_connect.has_saved_github_state(
-            session, tenant_id=invitation.tenant_id, agent_id=invitation.agent_id
         )
 
     async def successful_page(
@@ -1509,8 +1540,6 @@ def build_oauth_github_routes(
                     or not await may_manage_agent(session, invitation, requester, live)
                 ):
                     return _error("You can no longer manage this agent.", 403)
-            missing = await _missing(session, invitation)
-            pending = await _key_pending(session, invitation)
             agent_grants = (
                 await list_agent_repos(
                     session, tenant_id=invitation.tenant_id, agent_id=invitation.agent_id
@@ -1519,16 +1548,12 @@ def build_oauth_github_routes(
                 else []
             )
         if invitation.agent_id is not None:
-            return _saved_agent_page(
-                invitation.agent_name or "Agent", agent_grants, missing, pending
-            )
+            return _saved_agent_page(invitation.agent_name or "Agent", agent_grants)
         back = _back_to_chat(requester.platform, requester.external_id) if requester else ""
         return _already_connected_page(
             invitation.connected_repo_count,
             back,
             agent_name=invitation.agent_name,
-            update_pending=invitation.activation_status == "update_pending",
-            missing_repos=missing,
         )
 
     async def connect(request: Request) -> Response:
@@ -1552,7 +1577,6 @@ def build_oauth_github_routes(
                         invitation.connected_repo_count,
                         back,
                         agent_name=invitation.agent_name,
-                        update_pending=invitation.activation_status == "update_pending",
                     )
                 if status == "requester_left":
                     return _error(
@@ -1756,28 +1780,10 @@ def build_oauth_github_routes(
                 if invitation.agent_id is not None
                 else []
             )
-            # A staged or inactive repo, or one the agent still needs more of,
-            # can be ticked again; only a repo it fully has is settled.
             missing_access: dict[str, bool] = {}
             missing_names: list[str] = []
-            for missing in (
-                await github_connect.missing_required_repos(
-                    session, tenant_id=invitation.tenant_id, agent_id=invitation.agent_id
-                )
-                if invitation.agent_id is not None
-                else []
-            ):
-                # Needing write for any use of the repo means it needs write.
-                key = missing.full_name.casefold()
-                missing_access[key] = missing_access.get(key, False) or missing.needs_write
-                if missing.full_name not in missing_names:
-                    missing_names.append(missing.full_name)
             already_added = frozenset(
-                repo.repo_id
-                for repo in agent_repos
-                if not repo.staged
-                and repo.status == "active"
-                and repo.full_name.casefold() not in missing_access
+                repo.repo_id for repo in agent_repos if repo.status == "active"
             )
         token = decrypt_token(fernet, flow.encrypted_user_token)
         try:
@@ -1892,7 +1898,7 @@ def build_oauth_github_routes(
                 if repo.usable
             }
             old = {repo.repo_id: repo for repo in grants}
-            repairable = {repo.repo_id for repo in grants if repo.staged or repo.repo_id in needed}
+            repairable = {repo.repo_id for repo in grants if repo.repo_id in needed}
             working_before = next((repo.repo_id for repo in grants if repo.is_working_repo), None)
             working_choice = working_values[0]
             if working_choice not in ("keep", "clear"):
@@ -1992,7 +1998,23 @@ def build_oauth_github_routes(
                 )
                 for repo_id in selected_ids
             ]
-            activation: github_connect.ConfirmedActivation | None = None
+            if not invitation.operator_issued:
+                if (
+                    invitation.requester_platform_user_id is not None
+                    and invitation.requester_platform_user_id != requester.platform_user_id
+                ):
+                    return _error("You can no longer manage this agent.", 403, retry_confirm_url)
+                try:
+                    still_admin = await _attest_native_admin(
+                        requester=requester,
+                        settings=settings,
+                        sessionmaker=sessionmaker,
+                        fernet=fernet,
+                    )
+                except AdminAttestationUnavailable:
+                    return _error(_ADMIN_RETRY, 503, retry_confirm_url)
+                if not still_admin:
+                    return _error("You can no longer manage this agent.", 403, retry_confirm_url)
             try:
                 async with sessionmaker.begin() as session:
                     await session.execute(sql_text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
@@ -2026,6 +2048,14 @@ def build_oauth_github_routes(
                                 repository_selection=detail.repository_selection,
                                 suspended_at=detail.suspended_at,
                             )
+                            await enqueue_reconciliation(
+                                session,
+                                installation_id=detail.installation_id,
+                                delivery_id=f"connect:{uuid.uuid4()}",
+                                event="connect",
+                                deleted=False,
+                                now=datetime.now(UTC),
+                            )
                         for repo_id in removed_ids:
                             await github_access.remove_agent_repo(
                                 session,
@@ -2035,7 +2065,7 @@ def build_oauth_github_routes(
                                 account_id=invitation.requester_account_id,
                             )
                         if repos:
-                            activation = await github_connect.activate_confirmed_agent(
+                            await github_connect.activate_confirmed_agent(
                                 session, invitation=invitation, repos=repos
                             )
                         if working_choice != "keep":
@@ -2084,8 +2114,8 @@ def build_oauth_github_routes(
                         "The agent's repos changed. Reload and try again.", 409, retry_confirm_url
                     )
                 raise
-            except github_connect.ClientAgentConnectionError:
-                return _error(github_connect.CLIENT_AGENT_MESSAGE)
+            except github_connect.PinnedAgentConnectionError:
+                return _error(github_connect.PINNED_AGENT_MESSAGE)
             except ValueError:
                 return _error(
                     "This change could not be saved. Reload and try again.", 400, retry_confirm_url
@@ -2195,12 +2225,23 @@ def build_oauth_github_routes(
             is_daimon_managed = (
                 None if live is None else live.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
             )
-            members = (
-                group_members(requester.platform, requester.external_id)
-                if group_members is not None
-                else None
-            )
-            activation: github_connect.ConfirmedActivation | None = None
+            if not invitation.operator_issued:
+                if (
+                    invitation.requester_platform_user_id is not None
+                    and invitation.requester_platform_user_id != requester.platform_user_id
+                ):
+                    return _error("You can no longer manage this agent.", 403, retry_confirm_url)
+                try:
+                    still_admin = await _attest_native_admin(
+                        requester=requester,
+                        settings=settings,
+                        sessionmaker=sessionmaker,
+                        fernet=fernet,
+                    )
+                except AdminAttestationUnavailable:
+                    return _error(_ADMIN_RETRY, 503, retry_confirm_url)
+                if not still_admin:
+                    return _error("You can no longer manage this agent.", 403, retry_confirm_url)
             try:
                 async with sessionmaker.begin() as session:
                     saved = await github_connect.confirm(
@@ -2220,7 +2261,6 @@ def build_oauth_github_routes(
                             ma_agent_id=invitation.agent_ma_id,
                             default=deployment_default,
                             is_daimon_managed=is_daimon_managed,
-                            members=members,
                             other_names=agent_pin_names(live.name, live.metadata)
                             if live is not None
                             else (),
@@ -2237,7 +2277,15 @@ def build_oauth_github_routes(
                                 repository_selection=detail.repository_selection,
                                 suspended_at=detail.suspended_at,
                             )
-                        activation = await github_connect.activate_confirmed_agent(
+                            await enqueue_reconciliation(
+                                session,
+                                installation_id=detail.installation_id,
+                                delivery_id=f"connect:{uuid.uuid4()}",
+                                event="connect",
+                                deleted=False,
+                                now=datetime.now(UTC),
+                            )
+                        await github_connect.activate_confirmed_agent(
                             session, invitation=invitation, repos=repos
                         )
                         resumed_requests = await finish_confirmed_requests(
@@ -2262,9 +2310,9 @@ def build_oauth_github_routes(
                             reason="confirmed",
                             github_repo_ids=[repo.repo_id for repo in repos],
                         )
-            except github_connect.ClientAgentConnectionError:
+            except github_connect.PinnedAgentConnectionError:
                 await revoke_user_token(token)
-                return _error(github_connect.CLIENT_AGENT_MESSAGE)
+                return _error(github_connect.PINNED_AGENT_MESSAGE)
             except github_access.SecondInstallationError as exc:
                 await revoke_user_token(token)
                 return _error(str(exc))
@@ -2285,9 +2333,7 @@ def build_oauth_github_routes(
                 )
             await revoke_user_token(token)
             async with sessionmaker() as session:
-                confirmed = await github_connect.successful_confirmation(
-                    session, state=state, cookie=cookie
-                )
+                await github_connect.successful_confirmation(session, state=state, cookie=cookie)
             response = _done_page(
                 count=len(repos),
                 platform=requester.platform,
@@ -2295,13 +2341,6 @@ def build_oauth_github_routes(
                 requester_label=invitation.requester_label,
                 same_person=requester_github_id == flow.github_user_id,
                 agent_name=invitation.agent_name,
-                update_pending=confirmed is not None
-                and confirmed.activation_status == "update_pending",
-                retired_saved_key=activation is not None and activation.retired_saved_key,
-                missing_repos=tuple(
-                    (missing.full_name, missing.needs_write)
-                    for missing in (activation.missing_repos if activation else ())
-                ),
             )
             response.set_cookie(
                 _COOKIE,

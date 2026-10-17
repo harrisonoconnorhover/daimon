@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
@@ -51,12 +51,14 @@ from daimon.core.authz import (
     build_turn_place,
 )
 from daimon.core.billing import is_over_cap
-from daimon.core.channel_admins import ChannelAdminCaller, load_administered_channel_ids
 from daimon.core.channel_backend import (
     BackendUnsupported,
     channel_ref,
     check_backend,
     current_backend_and_sharing,
+)
+from daimon.core.channel_backend import (
+    log_backend_unsupported as _log_backend_unsupported,
 )
 from daimon.core.channel_budget import is_over_channel_budget
 from daimon.core.channel_budget_notice import spawn_budget_notice
@@ -86,7 +88,6 @@ from daimon.core.stores.access_policy import load_access_policy
 from daimon.core.stores.accounts import (
     get_external,
     set_external,
-    set_platform_role_ids,
     set_role,
 )
 from daimon.core.stores.channel_skills import list_channel_skills
@@ -245,6 +246,7 @@ class Admission:
             "channel",
             "agent",
         ):
+            _log_backend_unsupported("admission_origin")
             raise AdmissionDenied(reason="backend_unsupported")
 
 
@@ -261,6 +263,7 @@ def _require_backend_origin(
     if selection.profile != MANAGED_AGENTS.profile_id and not (
         fixed_plan_origin_allowed(origin) or (origin == "agent" and agent_backends)
     ):
+        _log_backend_unsupported("backend_origin")
         raise AdmissionDenied(reason="backend_unsupported")
 
 
@@ -307,7 +310,6 @@ async def admit(
     now: datetime,
     thread_id: str | None = None,
     role: Role | None = None,
-    platform_role_ids: Sequence[str] | None = None,
     is_dm: bool = False,
     dm_source_channel_id: str | None = None,
     category_id: str | None = None,
@@ -331,7 +333,6 @@ async def admit(
                 now=now,
                 thread_id=thread_id,
                 role=role,
-                platform_role_ids=platform_role_ids,
                 is_dm=is_dm,
                 dm_source_channel_id=dm_source_channel_id,
                 category_id=category_id,
@@ -382,7 +383,6 @@ async def admit_impl(
     now: datetime,
     thread_id: str | None = None,
     role: Role | None = None,
-    platform_role_ids: Sequence[str] | None = None,
     is_dm: bool = False,
     dm_source_channel_id: str | None = None,
     category_id: str | None = None,
@@ -422,41 +422,18 @@ async def admit_impl(
         is_external = stored or (external is not None and external.is_external)
         store_identity = stored or not is_external
         if is_external:
-            # Nor a channel admin: no stored group (a team they own) matches a grant.
-            role, platform_role_ids = Role.USER, ()
+            role = Role.USER
         if role is not None and store_identity:
             await set_role(session, principal.account_id, role)
-        # Kept like the role so MCP calls can match channel admin role grants.
-        if platform_role_ids is not None and store_identity:
-            await set_platform_role_ids(session, principal.account_id, platform_role_ids)
         await session.commit()
         mark("identity")
         # Read after the role commit, so a refused turn still records the role.
         policy = await load_access_policy(session, tenant_id=tenant_id)
-        # Matched against the live role ids; a server admin needs no grant.
-        administered = (
-            frozenset[str]()
-            # An external caller administers nothing, whatever a grant names.
-            if role is Role.ADMIN or is_external
-            else await load_administered_channel_ids(
-                session,
-                tenant_id=tenant_id,
-                platform=platform,
-                caller=ChannelAdminCaller(
-                    platform_user_id=external_user_id,
-                    role_ids=frozenset(platform_role_ids or ()),
-                ),
-            )
-        )
         mark("policy_and_admins")
 
         # Refusals must happen before config is read. Keeping the session here
         # reuses its connection for the config cascade after authorization.
-        subject = build_subject(
-            is_admin=role is Role.ADMIN,
-            platform_user_id=external_user_id,
-            administered_channel_ids=administered,
-        )
+        subject = build_subject(is_admin=role is Role.ADMIN, platform_user_id=external_user_id)
         turn_place = build_turn_place(
             channel_id=channel_id,
             thread_id=thread_id,
@@ -537,10 +514,12 @@ async def admit_impl(
                         session, channel, None, enabled=True, retained_revision=retained_revision
                     )
                 except (channel_backend.AgentBackendRefused, BackendUnsupported) as error:
+                    _log_backend_unsupported("retained_revision_lookup", error)
                     raise AdmissionDenied(reason="backend_unsupported") from error
                 if retained_revision == 0:
                     default = resolve_default(BackendConfig())
                     if (binding.provider, binding.profile) != (default.backend, default.profile):
+                        _log_backend_unsupported("retained_default_mismatch")
                         raise AdmissionDenied(reason="backend_unsupported")
                     backend_revision = None
                     backend_revision_origin = None
@@ -551,6 +530,7 @@ async def admit_impl(
                     or retained.backend != binding.provider
                     or retained.profile != binding.profile
                 ):
+                    _log_backend_unsupported("retained_binding_mismatch")
                     raise AdmissionDenied(reason="backend_unsupported")
                 backend_revision = retained
                 backend_revision_origin = source if source != "default" else None
@@ -590,6 +570,7 @@ async def admit_impl(
                     enabled_backends=policy.enabled_backends,
                 )
             except BackendUnsupported as error:
+                _log_backend_unsupported("retained_default_policy", error)
                 raise AdmissionDenied(reason="backend_unsupported") from error
     mark("config")
 
@@ -627,6 +608,7 @@ async def admit_impl(
             else None
         )
     except BackendUnsupported as err:
+        _log_backend_unsupported("channel_policy", err)
         raise AdmissionDenied(reason="backend_unsupported") from err
 
     async def _apply() -> object:
@@ -735,7 +717,7 @@ async def admit_impl(
         run_place=Place()
         if is_dm
         else replace(
-            build_turn_place(channel_id=channel_id, thread_id=thread_id),
+            turn_place,
             setup_thread=config.thread_binding_kind == "setup",
         ),
         channel_id=channel_id,
@@ -815,7 +797,12 @@ async def admit_impl(
             source=source_agent,
         )
         request, _ = scope_channel_runtimes(request)
-        prepared = await read_preparation_counterpart(request)
+        try:
+            prepared = await read_preparation_counterpart(request)
+        except AdmissionDenied as error:
+            if error.reason == "backend_unsupported":
+                _log_backend_unsupported("preparation_counterpart", error)
+            raise
         backend_counterpart = prepared.counterpart
         backend_agent_revision = agent_revision
 
@@ -838,6 +825,7 @@ async def admit_impl(
                         actual_agent=agent,
                     )
                 except channel_backend.AgentBackendRefused as error:
+                    _log_backend_unsupported("source_agent_lookup", error)
                     raise AdmissionDenied(reason="backend_unsupported") from error
                 async with deps.sessionmaker() as selection_session:
                     try:
@@ -862,6 +850,7 @@ async def admit_impl(
                             else None
                         )
                     except (channel_backend.AgentBackendRefused, BackendUnsupported) as error:
+                        _log_backend_unsupported("agent_preference", error)
                         raise AdmissionDenied(reason="backend_unsupported") from error
                     # Preparation uses another transaction. Publish the immutable
                     # effective revision and its origin before that transaction.
@@ -933,7 +922,7 @@ async def admit_impl(
                 platform=platform,
                 channel_id=budget_channel_id,
                 now=now,
-                group_members=deps.group_members,
+                server_admins=deps.server_admins,
             )
         raise AdmissionDenied(reason="channel_budget_exceeded")
 
@@ -1100,6 +1089,7 @@ async def reauthorize(deps: TurnDeps, admission: Admission) -> Admission:
         try:
             check_backend(admission.backend_revision, enabled_backends=policy.enabled_backends)
         except BackendUnsupported as error:
+            _log_backend_unsupported("reauthorize_policy", error)
             raise AdmissionDenied(reason="backend_unsupported") from error
     if grant.dm_source is not None and dm_source_limited(
         policy,
@@ -1352,7 +1342,9 @@ async def capture_backend_source(
                 datetime.now(UTC) + timedelta(seconds=30),
                 lambda: datetime.now(UTC),
             )
-            captured = await capture_preparation_source(request, fresh=True)
+            captured = await capture_preparation_source(
+                request, fresh=True, capability_preview=True
+            )
             if (captured.tenant_id, captured.agent_id) != (source.tenant_id, source.agent_id):
                 raise channel_backend.AgentBackendRefused("source_unavailable")
             return captured
