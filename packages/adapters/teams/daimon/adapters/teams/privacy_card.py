@@ -112,6 +112,9 @@ def _will_happen(preview: PurgePreview) -> list[str]:
         lines.append(f"🔗 Unlink {amount(preview.github_user_links.count, 'GitHub account')}")
     if preview.mcp_tokens.count:
         lines.append(f"🎫 Delete {amount(preview.mcp_tokens.count, 'Daimon access token')}")
+    if preview.gemini_records.count:
+        n = amount(preview.gemini_records.count, "Gemini conversation record")
+        lines.append(f"💬 Delete {n}")
     if preview.slack_user_tokens.count:
         lines.append(
             f"🔐 Delete {amount(preview.slack_user_tokens.count, 'saved Slack access token')}"

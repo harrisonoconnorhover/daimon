@@ -331,7 +331,8 @@ request and best-effort orphan interrupt without additional provider reads.
 Tenant operations check the host's authorized agent/session IDs before I/O.
 Its workspace-wide snapshot walks require explicit platform Scope and preserve
 `limit=100` with omitted archive filters. Destructive test cleanup keeps both the
-host opt-in and disposable-sentinel gate, its early exit and archive fallbacks.
+host opt-in and disposable-sentinel gate, its early exit and archive fallbacks. The dev-lane ownership check also uses platform-scope walks with
+`include_archived`, a has-any-environment/vault/memory-store probe, and a bare marker-agent create.
 Native snapshots retain SDK partial-response fields without requiring unused
 agent/session properties. DM archive retains the selected TurnIO/backend
 dispatch. Responder identity keeps its SDK read and untouched response for
@@ -1066,3 +1067,10 @@ interaction for the worker, including after restart, so these are aggregate
 worker ceilings. No second turn, tool result, model fallback or replacement on
 uncertain delivery can obtain another envelope. Omitting token ceilings retains
 the existing managed worker path and ordinary Gemini turns.
+
+Explicit Gemini catalog deployments can carry caller-bound MCP references when
+an MCP resolver is injected. Catalog compilation and native readback preserve
+only destination and allowlist; bearer values are resolved afresh for interaction
+requests. `RetainedSkillDeployments` implements the existing publisher contract
+for independently provisioned immutable GCS directories, verifying the complete
+scope, version and every retained file digest without making storage writes.

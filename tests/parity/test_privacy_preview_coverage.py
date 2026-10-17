@@ -54,6 +54,10 @@ _COUNTED_CASCADE_ROWS = {
     ),
     "github_user_links": ("Unlink {n} GitHub account", "Unlink {n} GitHub accounts"),
     "mcp_tokens": ("Delete {n} Daimon access token", "Delete {n} Daimon access tokens"),
+    "gemini_records": (
+        "Delete {n} Gemini conversation record",
+        "Delete {n} Gemini conversation records",
+    ),
     "slack_user_tokens": (
         "Delete {n} saved Slack access token",
         "Delete {n} saved Slack access tokens",
@@ -98,6 +102,7 @@ _COUNTED_SUMMARY_LABELS = {
     "github_connect_click_intents": ("GitHub connect button", "GitHub connect buttons"),
     "github_user_links": ("linked GitHub account", "linked GitHub accounts"),
     "mcp_tokens": ("Daimon access token", "Daimon access tokens"),
+    "gemini_records": ("Gemini conversation record", "Gemini conversation records"),
     "slack_user_tokens": ("saved Slack access token", "saved Slack access tokens"),
     "slack_turn_contexts": ("temporary Slack request record", "temporary Slack request records"),
     "direct_message_conversations": ("private conversation", "private conversations"),

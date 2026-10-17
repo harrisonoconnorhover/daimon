@@ -10,6 +10,7 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
+from anthropic.types.beta.vaults import BetaManagedAgentsCredential
 from daimon.core.credential_requests import mint_request_token
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.mcp_oauth.complete import (
@@ -142,25 +143,31 @@ def _fake_ma(
             ]
         ),
     )
+    chat_credential = {
+        "id": "vcrd_jwt",
+        "type": "vault_credential",
+        "vault_id": vault_id,
+        "auth": {"type": "static_bearer", "mcp_server_url": _PUBLIC_URL},
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z",
+        "archived_at": None,
+        "display_name": None,
+        "metadata": {"daimon_chat_identity": str(agent_id)},
+    }
     router.add(
         "GET",
         rf"/v1/vaults/{vault_id}/credentials",
-        lambda _r, _m: list_response(
-            [
-                {
-                    "id": "vcrd_jwt",
-                    "type": "vault_credential",
-                    "vault_id": vault_id,
-                    "auth": {"type": "static_bearer", "mcp_server_url": _PUBLIC_URL},
-                    "created_at": "2026-09-01T00:00:00Z",
-                    "updated_at": "2026-09-01T00:00:00Z",
-                    "archived_at": None,
-                    "display_name": None,
-                    "metadata": {"daimon_chat_identity": str(agent_id)},
-                }
-            ]
-        ),
+        lambda _r, _m: list_response([chat_credential]),
     )
+
+    def on_refresh(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        # Renewal precedes the OAuth grant write and does not attach a server.
+        chat_credential["metadata"] = json_body(req)["metadata"]
+        chat_credential["updated_at"] = _NOW.isoformat()
+        response = BetaManagedAgentsCredential.model_validate(chat_credential)
+        return httpx.Response(200, json=response.model_dump(mode="json"))
+
+    router.add("POST", rf"/v1/vaults/{vault_id}/credentials/vcrd_jwt", on_refresh)
 
     def on_create_credential(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         body = json_body(req)
@@ -323,92 +330,6 @@ async def test_complete_lets_an_admin_requester_repoint_a_shared_agents_server(
     )
     assert completion.ma_agent_id == "ag_oauth"
     assert [s["url"] for s in updates[0]["mcp_servers"]] == [flow.mcp_server_url]
-
-
-@pytest.mark.parametrize("granted", [True, False], ids=["channel-admin", "member"])
-async def test_complete_decides_a_repoint_as_the_request_did_for_a_channel_admin(
-    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession], granted: bool
-) -> None:
-    """The callback builds the requester from their stored platform id and role ids, so a
-    channel admin allowed when asking is not refused after the token is already stored.
-    A server admin set c1's default, so its admins hold the agent."""
-    from daimon.core.mcp_attach import McpServerReplaceRefusedError
-    from daimon.core.scope import ChannelScopeRef
-    from daimon.core.stores.accounts import get_account, set_platform_role_ids
-    from daimon.core.stores.channel_admins import set_channel_admins
-    from daimon.core.stores.scoped_config_write import set_fields
-    from daimon.core.stores.tenants import get_tenant
-    from daimon.testing.factories import make_platform_principal
-
-    flow, tenant_id = await _flow(db_session)
-    tenant = await get_tenant(db_session, tenant_id)
-    account = await get_account(db_session, flow.account_id)
-    assert tenant is not None and account is not None, "the flow's tenant and account exist"
-    await make_platform_principal(
-        db_session, platform="discord", external_id="requester-1", tenant=tenant, account=account
-    )
-    await set_platform_role_ids(db_session, account.id, ["r1"])
-    await set_fields(
-        db_session,
-        scope=ChannelScopeRef(tenant_id=tenant_id, channel_id="c1"),
-        tenant_id=tenant_id,
-        agent_name="daimon",
-        mode="agent",
-        set_by_admin=True,
-    )
-    await set_channel_admins(
-        db_session,
-        tenant_id=tenant_id,
-        platform="discord",
-        channel_id="c1" if granted else "c9",
-        role_ids=["r1"],
-        user_ids=[],
-        actor_account_id=None,
-    )
-    from daimon.core.access_policy import TenantAccessPolicy
-    from daimon.core.stores.access_policy import set_access_policy
-
-    await set_access_policy(
-        db_session,
-        tenant_id=tenant_id,
-        policy=TenantAccessPolicy(agent_channel_pins={"daimon": ("c1",)}),
-    )
-    await db_session.commit()
-
-    def token_handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"access_token": "at", "expires_in": 3600})
-
-    anthropic, _created, updates = _fake_ma(
-        tenant_id,
-        vault_id="vlt_me",
-        account_id=flow.account_id,
-        agent_id=flow.agent_id,
-        mcp_servers=[{"name": "notion", "type": "url", "url": "https://real.example.com/mcp"}],
-    )
-
-    async def complete() -> None:
-        await complete_mcp_oauth_flow(
-            httpx.AsyncClient(transport=httpx.MockTransport(token_handler)),
-            anthropic,
-            flow=flow,
-            code="code123",
-            fernet=make_fernet(),
-            jwt_secret=b"x" * 32,
-            public_url=_PUBLIC_URL,
-            now=_NOW,
-            session_factory=db_session_factory,
-            default=DeploymentDefault(agent_name="other", environment_name="default"),
-        )
-
-    if not granted:
-        with pytest.raises(McpServerReplaceRefusedError):
-            await complete()
-        assert updates == [], "an admin of another channel does not repoint c1's agent"
-        return
-    await complete()
-    assert [s["url"] for s in updates[0]["mcp_servers"]] == [flow.mcp_server_url], (
-        "the admin of the only channel the agent answers in repoints its server"
-    )
 
 
 async def test_member_oauth_cannot_attach_a_new_server_to_an_unbound_agent(

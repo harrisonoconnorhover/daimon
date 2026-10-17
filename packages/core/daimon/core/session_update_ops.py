@@ -50,6 +50,7 @@ from daimon.core.config import GithubAppSettings, McpSettings
 from daimon.core.credential_env import assemble_env_bytes, upload_env_file
 from daimon.core.errors import DaimonError
 from daimon.core.github_app_session import rotate_live_app_tokens
+from daimon.core.mcp_vault import refresh_mounted_mcp_vaults
 from daimon.core.session_compat import (
     ChangeReason,
     RemirrorVaultCredentials,
@@ -61,6 +62,7 @@ from daimon.core.session_compat import (
 from daimon.core.session_ports_compat import (
     add_session_file_record,
     remove_session_resource_record,
+    retrieve_session_record,
     session_scope,
     update_session_record,
     walk_session_resource_records,
@@ -71,6 +73,7 @@ from daimon.core.session_snapshot import (
     hash_env_bytes,
     hash_mcp_servers,
     hash_tools,
+    refreshed_unavailable_state,
     session_mcp_servers,
     session_tools,
 )
@@ -240,6 +243,7 @@ async def apply_update_ops(
     asks_before_publishing: bool = False,
     confirmed_tools: frozenset[str] = frozenset(),
     mcp_vault_ids: McpVaultIds | None = None,
+    shared_owner: uuid.UUID | None = None,
 ) -> AppliedOps | SessionBusy:
     """Run `ops` against the live session and return what it runs afterwards.
 
@@ -254,6 +258,31 @@ async def apply_update_ops(
     )
     snapshot = recorded
     applied: list[ChangeReason] = []
+
+    # Shared workspaces must never acquire a caller's MCP identity. App mode
+    # can mount both a caller and a repository vault; refresh every actual slot
+    # rather than relying on undocumented provider credential precedence.
+    if (
+        shared_owner is None
+        and snapshot.vault_id is not None
+        and mcp.public_url is not None
+        and mcp.jwt_secret is not None
+    ):
+        mounted_vaults = (snapshot.vault_id,)
+        if snapshot.github_mode == "app":
+            live = await retrieve_session_record(anthropic, session_id, scope=scope)
+            mounted_vaults = tuple(dict.fromkeys(live.vault_ids))
+        await refresh_mounted_mcp_vaults(
+            anthropic,
+            vault_ids=mounted_vaults,
+            account_id=account_id,
+            agent_id=agent_uuid,
+            jwt_secret=mcp.jwt_secret.get_secret_value().encode(),
+            public_url=str(mcp.public_url),
+            now=now,
+            session_factory=sessionmaker,
+            scope=scope,
+        )
 
     for op in ops:
         match op:
@@ -317,9 +346,9 @@ async def apply_update_ops(
                 )
                 applied.extend(("tools", "mcp_servers"))
             case RotateAppTokens():
-                if snapshot.vault_id is None or fernet is None:
+                if snapshot.vault_id is None or not isinstance(fernet, MultiFernet):
                     raise ValueError("App session has no vault or encryption")
-                await rotate_live_app_tokens(
+                access = await rotate_live_app_tokens(
                     anthropic,
                     sessionmaker,
                     session_id=session_id,
@@ -329,11 +358,23 @@ async def apply_update_ops(
                     is_external=is_external,
                     vault_id=snapshot.vault_id,
                     resource_ids=op.resource_ids,
+                    unavailable_repos=snapshot.unavailable_repos,
                     config=agent_github_app or GithubAppSettings(),
                     fernet=fernet,
                 )
                 snapshot = snapshot.model_copy(
-                    update={"repo_token_issued_at": int(now.timestamp())}
+                    update={
+                        "repo_urls": tuple(
+                            url
+                            for url in snapshot.repo_urls
+                            if url not in access.excluded_repo_urls
+                        ),
+                        "token_repo_urls": access.token_repo_urls,
+                        **refreshed_unavailable_state(
+                            snapshot, access.excluded_repo_urls, now=dt.datetime.now(dt.UTC)
+                        ),
+                        "repo_token_issued_at": int(now.timestamp()),
+                    }
                 )
                 applied.append("repo_token_age")
             case RemirrorVaultCredentials():

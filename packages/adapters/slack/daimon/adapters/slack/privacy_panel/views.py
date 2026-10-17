@@ -78,6 +78,9 @@ def _cascade_blocks(preview: PurgePreview) -> list[dict[str, Any]]:
         will_happen_lines.append(
             f"• 🎫 Delete {amount(preview.mcp_tokens.count, 'Daimon access token')}"
         )
+    if preview.gemini_records.count > 0:
+        n = amount(preview.gemini_records.count, "Gemini conversation record")
+        will_happen_lines.append(f"• 💬 Delete {n}")
     if preview.slack_user_tokens.count > 0:
         will_happen_lines.append(
             f"• 🔐 Delete {amount(preview.slack_user_tokens.count, 'saved Slack access token')}"

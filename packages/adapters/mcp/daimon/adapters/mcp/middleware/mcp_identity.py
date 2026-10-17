@@ -11,7 +11,6 @@ Runs only on requests that already passed `DaimonJWTVerifier.verify_token`
   7. Ask `agent_id_resolver` for the optional `agent_id` claim.
   8. Stash an `AuthIdentity` into `ctx.fastmcp_context.set_state("auth", ...)`.
   9. Call `enable_components` for admin sessions so admin-tagged tools are visible,
-     and for channel admins so the `channel-admin` subset of them is.
      An operator token instead sees only the tools tagged with its scopes,
      and its tool calls are rate limited per jti.
 
@@ -99,7 +98,7 @@ async def production_is_admin_resolver(context: MiddlewareContext) -> str | None
 async def production_internal_resolver(context: MiddlewareContext) -> str | None:
     """Return "true" iff the token carries internal=True (the trusted-token discriminator).
 
-    ``internal=True`` is emitted ONLY by ``mint_internal_mcp_token`` (CLI/scheduler/headless).
+    Historical jti-less internal tokens are refused before this middleware.
     A Discord vault token minted by ``mint_jwt`` never carries this claim. The admin gate
     keys on ``(role == ADMIN) OR (is_admin_claim AND internal_claim)`` so a stale pre-sweep
     Discord vault credential with ``is_admin=True`` and ``role=user`` is denied admin
@@ -320,7 +319,7 @@ class IdentityMiddleware(Middleware):
         internal_claim = (await self._internal_resolver(context)) == "true"
         # Admin gate: a Discord vault token's baked is_admin claim alone
         # MUST NOT elevate a non-admin caller. The internal discriminator distinguishes
-        # trusted internal tokens (CLI/scheduler/headless, minted by mint_internal_mcp_token)
+        # historical internal claims (jti-less tokens are refused by the verifier)
         # from Discord vault tokens (minted by mint_jwt, which never emits internal=True).
         # Gate: DB role == ADMIN  OR  (is_admin claim AND internal claim).
         # An account from another organisation is never an admin, by any claim.
@@ -333,22 +332,6 @@ class IdentityMiddleware(Middleware):
                 slack_turn_context_id = uuid.UUID(raw_slack_context)
             except ValueError:
                 slack_turn_context_id = None  # Malformed claims fail closed.
-        raw_role_ids = _token.claims.get("platform_role_ids") if _token else None
-        platform_role_ids = (
-            tuple(str(value) for value in cast(list[object], raw_role_ids))
-            if isinstance(raw_role_ids, list)
-            else ()
-        )
-        # Only a chat identity administers channels; an agent credential never does.
-        raw_administered = _token.claims.get("administered_channel_ids") if _token else None
-        administered_channel_ids = (
-            frozenset(str(value) for value in cast(list[object], raw_administered))
-            if isinstance(raw_administered, list)
-            and not is_admin
-            and not is_external
-            and agent_id is None
-            else frozenset[str]()
-        )
         raw_bound_channel = _token.claims.get("bound_channel_id") if _token else None
         identity = AuthIdentity(
             account_id=account_id,
@@ -361,8 +344,6 @@ class IdentityMiddleware(Middleware):
             slack_turn_context_id=slack_turn_context_id,
             platform_user_id=platform_user_id,
             is_admin=is_admin,
-            platform_role_ids=platform_role_ids,
-            administered_channel_ids=administered_channel_ids,
             # Set by the verifier from the token's row; an agent key's only.
             bound_channel_id=(
                 raw_bound_channel
@@ -384,9 +365,6 @@ class IdentityMiddleware(Middleware):
             return await self._resolve_operator(context, call_next, identity)
         if is_admin:
             await enable_components(fastmcp_ctx, tags={"admin"})
-        elif identity.is_channel_admin:
-            # The admin tools a channel admin may call for their own channels.
-            await enable_components(fastmcp_ctx, tags={"channel-admin"})
         # Enable the caller's platform tag (deny-by-default baselines live in
         # server.py). A CLI token's platform="cli" matches no baseline tag,
         # so this enable is a no-op for CLI — the intended outcome: CLI loses

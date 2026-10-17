@@ -18,7 +18,14 @@ import structlog
 from daimon.core.session_snapshot import SessionSnapshot
 from mux.contracts.ids import PROVIDERS, Provider, Scope
 from mux.contracts.profile import Capability
-from mux.contracts.resources import Agent, AgentSpec, Environment, ResourceBinding, WorkspaceSource
+from mux.contracts.resources import (
+    Agent,
+    AgentSpec,
+    Environment,
+    EnvironmentSpec,
+    ResourceBinding,
+    WorkspaceSource,
+)
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -90,20 +97,6 @@ class AccountIdentityRow(BaseModel):
     platform_role_ids: tuple[str, ...] = ()
     # accounts.is_external: the last positive evidence about the account's organisation.
     is_external: bool = False
-
-
-class ChannelAdminsRow(BaseModel):
-    """One channel's admins beyond the server admins: role ids and user ids."""
-
-    model_config = ConfigDict(from_attributes=True, frozen=True)
-
-    tenant_id: uuid.UUID
-    platform: str
-    channel_id: str
-    role_ids: tuple[str, ...]
-    user_ids: tuple[str, ...]
-    updated_by_account_id: uuid.UUID | None
-    updated_at: datetime
 
 
 class ChannelSkillRow(BaseModel):
@@ -423,17 +416,6 @@ class TeamsInstallationRow(BaseModel):
     team_id: str
     group_id: str
     name: str | None = None
-
-
-class TeamsChannelSiteRow(BaseModel):
-    model_config = ConfigDict(from_attributes=True, frozen=True)
-
-    tenant_id: uuid.UUID
-    channel_id: str
-    group_id: str
-    site_id: str
-    drive_id: str
-    folder_id: str
 
 
 class TeamsChannelSubscriptionRow(BaseModel):
@@ -811,6 +793,9 @@ class GitHubAppInstallationRow(BaseModel):
     installation_id: int
     account_login: str
     repo_full_names: tuple[str, ...]
+    github_repo_full_names: tuple[str, ...] | None = None
+    github_refreshed_at: datetime | None = None
+    github_removed_at: datetime | None = None
     app: Literal["legacy", "github_app"] = "legacy"
     account_id: int | None = None
     account_type: str | None = None
@@ -1126,6 +1111,15 @@ class CompatibilityItem(_Facts):
     providers: tuple[Provider, ...] = PROVIDERS
 
 
+class SourceRepresentation(_Facts):
+    """Owner-verified translation of immutable source capabilities, never request intent."""
+
+    source_pin: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target: AgentSpec
+    credential_refs: tuple[str, ...] = ()
+    environment: EnvironmentSpec | None = None
+
+
 class BackendAgent(_Facts):
     """Host-resolved scoped agent; never populate this from request ownership claims."""
 
@@ -1153,6 +1147,7 @@ class BackendAgent(_Facts):
     memory_store_id: str | None = Field(default=None, exclude=True, repr=False)
     memory_read_only: bool | None = Field(default=None, strict=True, exclude=True, repr=False)
     memory_instructions: str | None = Field(default=None, exclude=True, repr=False)
+    representations: tuple[SourceRepresentation, ...] = Field(default=(), exclude=True, repr=False)
 
 
 class TenantBackendPolicy(_Facts):

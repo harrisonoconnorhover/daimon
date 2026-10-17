@@ -15,6 +15,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from mux.contracts.ids import Scope, SkillRef
 from mux.drivers.openai._common import Context, text
+from mux.drivers.openai.skills import retry_not_found, verify_content
 from mux.drivers.openai.transport import Object, object_json, segment
 
 KEY = "mux_skill_pins"
@@ -26,7 +27,10 @@ def encode(pins: Sequence[SkillRef], context: Context) -> str:
     for pin in pins:
         if (
             pin.source is not None
-            or pin.digest is not None
+            or (
+                pin.digest is not None
+                and (pin.version is None or re.fullmatch(r"[a-f0-9]{64}", pin.digest) is None)
+            )
             or (pin.version is not None and _VERSION.fullmatch(pin.version) is None)
         ):
             raise context.unsupported("skill_catalogue_or_version")
@@ -87,7 +91,10 @@ def decode(metadata: JsonValue) -> tuple[SkillRef, ...] | None:
         text(pin.id)
         if (
             pin.source is not None
-            or pin.digest is not None
+            or (
+                pin.digest is not None
+                and (pin.version is None or re.fullmatch(r"[a-f0-9]{64}", pin.digest) is None)
+            )
             or (pin.version is not None and _VERSION.fullmatch(pin.version) is None)
         ):
             raise ValueError("invalid stored skill pin")
@@ -115,7 +122,7 @@ async def resolve_pins(
         path = "/skills/" + segment(pin.id)
         if pin.version is not None:
             path += "/versions/" + segment(pin.version)
-        raw = await context.call("GET", path)
+        raw = await retry_not_found(lambda path=path: context.call("GET", path))
         if pin.version is None:
             if raw.get("id") != pin.id:
                 raise ValueError("wrong skill identity")
@@ -125,6 +132,8 @@ async def resolve_pins(
         version = text(raw["default_version"] if pin.version is None else raw["version"])
         if _VERSION.fullmatch(version) is None:
             raise ValueError("invalid resolved skill version")
+        if pin.digest is not None:
+            await verify_content(context, pin.id, version, pin.digest)
         result.append(pin.model_copy(update={"version": version}))
     return tuple(result)
 

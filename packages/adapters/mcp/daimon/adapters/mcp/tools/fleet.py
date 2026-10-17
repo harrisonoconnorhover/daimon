@@ -61,6 +61,8 @@ class FleetToolService(Protocol):
         budget_usd: Decimal,
         deadline: datetime,
         max_turns: int,
+        max_input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
         result_contract: Mapping[str, JsonValue] | None,
         reviewer_of: uuid.UUID | None,
         origin_context_id: uuid.UUID | None = None,
@@ -211,7 +213,6 @@ class HostFleetToolService:
             or parent.agent_id != caller.chat_agent_id
             or parent.subject.via_agent_key
             or (parent.subject.is_admin and not caller.is_admin)
-            or not parent.subject.administered_channel_ids <= caller.administered_channel_ids
             or caller.is_external
             or caller.agent_id is not None
         ):
@@ -234,6 +235,8 @@ class HostFleetToolService:
         budget_usd: Decimal,
         deadline: datetime,
         max_turns: int,
+        max_input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
         result_contract: Mapping[str, JsonValue] | None,
         reviewer_of: uuid.UUID | None,
         origin_context_id: uuid.UUID | None = None,
@@ -251,7 +254,13 @@ class HostFleetToolService:
             operation_key=operation_key,
             role=role,
             backend=backend,
-            limits=WorkerLimits(budget_usd=budget_usd, deadline=deadline, max_turns=max_turns),
+            limits=WorkerLimits(
+                budget_usd=budget_usd,
+                deadline=deadline,
+                max_turns=max_turns,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+            ),
             agent=agent,
             clone=clone,
             clone_revision=clone_revision,
@@ -365,6 +374,8 @@ def register_fleet_tools(
         budget_usd: Decimal,
         deadline: datetime,
         max_turns: int,
+        max_input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
         result_contract: Mapping[str, JsonValue] | None,
         reviewer_of: uuid.UUID | None,
         origin_context_id: uuid.UUID | None = None,
@@ -394,6 +405,8 @@ def register_fleet_tools(
                 budget_usd=budget_usd,
                 deadline=deadline,
                 max_turns=max_turns,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
                 result_contract=result_contract,
                 reviewer_of=reviewer_of,
             )
@@ -408,6 +421,8 @@ def register_fleet_tools(
         budget_usd: PositiveMoney,
         deadline: datetime,
         max_turns: PositiveCount = 1,
+        max_input_tokens: PositiveCount | None = None,
+        max_output_tokens: PositiveCount | None = None,
         run_id: uuid.UUID | None = None,
         agent: AgentSpec | None = None,
         clone: ResourceRef | None = None,
@@ -438,6 +453,8 @@ def register_fleet_tools(
             budget_usd=budget_usd,
             deadline=deadline,
             max_turns=max_turns,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
             result_contract=result_contract,
             reviewer_of=None,
         )
@@ -508,6 +525,8 @@ def register_fleet_tools(
         deadline: datetime,
         role: str = "review",
         max_turns: PositiveCount = 1,
+        max_input_tokens: PositiveCount | None = None,
+        max_output_tokens: PositiveCount | None = None,
         agent: AgentSpec | None = None,
         clone: ResourceRef | None = None,
         clone_revision: Revision | None = None,
@@ -536,6 +555,8 @@ def register_fleet_tools(
             budget_usd=budget_usd,
             deadline=deadline,
             max_turns=max_turns,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
             result_contract=result_contract,
             reviewer_of=reviewed_worker_id,
         )
